@@ -110,7 +110,11 @@ def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) ->
 
     if obv_at_curr > obv_at_prev:
         div_strength = ((obv_at_curr - obv_at_prev) / abs(obv_at_prev) * 100) if obv_at_prev != 0 else 0
-        return {"bullish_div": True, "div_strength": round(abs(div_strength), 2)}
+        div_strength = round(abs(div_strength), 2)
+        # 背離強度 < 2% = OBV 幾乎沒差，不算真正背離
+        if div_strength < 2.0:
+            return {"bullish_div": False, "div_strength": div_strength}
+        return {"bullish_div": True, "div_strength": div_strength}
 
     return {"bullish_div": False, "div_strength": 0}
 
@@ -207,11 +211,13 @@ def is_rejection_candle(row, direction="bullish") -> bool:
 def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_ratio) -> int:
     """
     綜合評分（0-100）
-    OBV 佔 70 分，GP + rejection + volume 佔 30 分
+    核心原則：穿越或背離是「主訊號」，斜率加速是「加分項」
+    單獨斜率加速 + MA上方 不夠格，必須有主訊號才能拿到有意義的分數
     """
     score = 0
+    has_main_signal = cross_info["crossed_up"] or div_info["bullish_div"]
 
-    # --- OBV 穿越 (0-25 分) ---
+    # --- OBV 穿越 (0-25 分) --- 主訊號
     if cross_info["crossed_up"]:
         score += 15
         if cross_info["bars_since_cross"] == 0:
@@ -219,7 +225,7 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
         elif cross_info["bars_since_cross"] == 1:
             score += 5
 
-    # --- OBV 底背離 (0-30 分) --- 最強訊號
+    # --- OBV 底背離 (0-30 分) --- 最強主訊號
     if div_info["bullish_div"]:
         score += 20
         if div_info["div_strength"] > 10:
@@ -228,14 +234,18 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
             score += 5
 
     # --- OBV 斜率加速 (0-15 分) ---
+    # 有主訊號時才給滿分，單獨觸發只給 5 分（不足以過門檻）
     if slope_info["accelerating"]:
-        score += 15
+        if has_main_signal:
+            score += 15  # 加分項：主訊號 + 斜率 = 強確認
+        else:
+            score += 5   # 單獨斜率 = 弱訊號，不足以單獨立案
 
     # --- Golden Pocket (0-15 分) ---
     if gp_info.get("in_gp"):
         score += 10
         if gp_info.get("deviation", 999) < 30:
-            score += 5  # 越靠近 GP 中心越好
+            score += 5
 
     # --- 拒絕 K 線 (0-5 分) ---
     if has_rejection:
@@ -284,12 +294,16 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
         div_info = detect_obv_divergence(df, obv, window=20)
         slope_info = detect_obv_slope(obv, short_period=5, long_period=20)
 
-        # OBV 基本條件：至少一個 OBV 訊號觸發
+        # OBV 基本條件：必須有「主訊號」（穿越或背離）
+        # 單獨「斜率加速 + MA上方」不夠格進入候選
         obv_above_ma = current['OBV'] > current['OBV_MA20']
-        has_obv_signal = cross_info["crossed_up"] or div_info["bullish_div"] or slope_info["accelerating"]
+        has_main_signal = cross_info["crossed_up"] or div_info["bullish_div"]
+        has_slope = slope_info["accelerating"]
 
-        if not obv_above_ma and not has_obv_signal:
-            return None
+        if not has_main_signal:
+            # 沒有主訊號：只有 斜率+MA上方+放量 才勉強保留
+            if not (has_slope and obv_above_ma and vol_ratio >= 2.0):
+                return None
 
         # === Golden Pocket（可選） ===
         gp_info = {"in_gp": False, "gp_range": "-", "deviation": 999, "struct_pct": 0}
@@ -340,9 +354,9 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
 # ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V2 OBV 波段掃描器", layout="wide")
-st.title("🐬 Dolphin V2 — OBV 核心波段掃描器")
-st.markdown("以 **OBV 資金流向**為核心訊號（穿越 / 底背離 / 斜率加速），輔以 Golden Pocket 與 K 線形態。")
+st.set_page_config(page_title="Dolphin V2.1 OBV 波段掃描器", layout="wide")
+st.title("🐬 Dolphin V2.1 — OBV 核心波段掃描器")
+st.markdown("以 **OBV 資金流向**為核心（穿越 / 底背離 / 斜率加速），單獨斜率不成立，必須有主訊號。")
 
 # --- Sidebar ---
 st.sidebar.header("⚙️ 1. 股票池")
@@ -398,18 +412,20 @@ use_rejection = st.sidebar.toggle("啟用下影線拒絕過濾", value=False,
 min_struct_pct = st.sidebar.slider("GP 最小結構幅度 (%)", 5.0, 15.0, 8.0, 0.5,
                                    help="波段高低差佔價格的最小百分比，避免盤整區間的假 Fib") if use_gp else 8.0
 
-min_score = st.sidebar.slider("最低評分門檻", 15, 60, 20, 5,
-                               help="低於此分數的標的不會顯示")
+min_score = st.sidebar.slider("最低評分門檻", 15, 60, 30, 5,
+                               help="低於此分數的標的不會顯示（建議 30 以上）")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
-**評分權重說明**
-- OBV 穿越：15-25分
-- OBV 底背離：20-30分（最強）
-- OBV 斜率加速：15分
+**評分邏輯（V2.1）**
+- OBV 穿越：15-25分（主訊號）
+- OBV 底背離：20-30分（最強主訊號）
+- OBV 斜率加速：有主訊號+15 / 單獨僅+5
 - Golden Pocket：10-15分
 - 下影線拒絕：5分
 - 量能倍數：4-10分
+
+*必須有穿越或背離才算有效訊號*
 """)
 
 # --- 驗證清單按鈕 ---

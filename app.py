@@ -2,8 +2,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import time
+import re # 加入正則表達式，用來自動抓取 CSV 裡的代碼
 
 def calculate_obv(df):
     return (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
@@ -66,7 +66,8 @@ def fetch_and_scan(tickers, use_rejection):
             pass
         
         progress_bar.progress((i + 1) / total)
-        time.sleep(0.1)
+        # 加入微小延遲，防止被 Yahoo Finance 鎖 IP
+        time.sleep(0.15)
         
     status_text.text("掃描完成！")
     return pd.DataFrame(results)
@@ -75,18 +76,34 @@ st.set_page_config(page_title="Dolphin 波段掃描器", layout="wide")
 st.title("🐬 Dolphin 波段資金雷達 (台股版)")
 st.markdown("結合 **OBV 資金流向** 與 **0.618 金色口袋** 的高勝率波段掃描工具。")
 
-st.sidebar.header("⚙️ 掃描設定")
-default_tickers = "2330, 2317, 2454, 2308, 2382, 3231, 2603, 1513, 1519, 2376, 2357, 6235, 3481, 2618"
-ticker_input = st.sidebar.text_area("輸入股票代碼 (用逗號分隔)", value=default_tickers)
+st.sidebar.header("⚙️ 1. 輸入股票代碼")
+st.sidebar.markdown("你可以手動輸入，或是直接上傳 CSV 檔案。")
+
+# --- 新增：CSV 檔案上傳區 ---
+uploaded_file = st.sidebar.file_uploader("📂 上傳自選股清單 (CSV檔)", type=["csv"])
+ticker_list = []
+
+if uploaded_file is not None:
+    # 自動讀取檔案內容並抓取所有 4 位數代碼
+    content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+    found_tickers = re.findall(r'\b\d{4}\b', content)
+    ticker_list = list(set(found_tickers)) # 去除重複
+    st.sidebar.success(f"成功從檔案中抓取 {len(ticker_list)} 檔股票代碼！")
+else:
+    # 如果沒有上傳檔案，就使用輸入框的內容
+    default_tickers = "2330, 2317, 2454, 2308, 2382, 3231, 2603, 1513, 1519, 2376, 2357, 6235"
+    ticker_input = st.sidebar.text_area("✍️ 手動輸入 (用逗號分隔)", value=default_tickers)
+    ticker_list = [t.strip() for t in ticker_input.split(",") if t.strip()]
+
+st.sidebar.header("⚙️ 2. 掃描過濾設定")
 use_rejection = st.sidebar.toggle("啟用「長下影線拒絕」過濾", value=True)
 st.sidebar.markdown("---")
-st.sidebar.warning("⚠️ **系統提示**：任何新策略或掃描訊號投入實戰前，請務必先進行歷史回測 (Backtesting) 驗證數據。")
 
 if st.button("🚀 開始掃描", type="primary"):
-    ticker_list = [t.strip() for t in ticker_input.split(",") if t.strip()]
     if not ticker_list:
-        st.error("請輸入至少一檔股票代碼！")
+        st.error("找不到任何股票代碼，請確認檔案內容或手動輸入！")
     else:
+        st.info(f"即將掃描 {len(ticker_list)} 檔股票，數量較多時請耐心等待防封鎖機制...")
         with st.spinner("系統正在運算指標與比對區間，請稍候..."):
             df_result = fetch_and_scan(ticker_list, use_rejection)
             if not df_result.empty:

@@ -77,41 +77,59 @@ st.markdown("結合 **OBV 資金流向** 與 **0.618 金色口袋** 的高勝率
 
 st.sidebar.header("⚙️ 1. 輸入或過濾股票代碼")
 
-# --- 進階 CSV 功能區 ---
-uploaded_file = st.sidebar.file_uploader("📂 上傳自選股清單 (CSV檔)", type=["csv"])
+# --- 進階：支援 CSV 與 Excel 雙打 ---
+uploaded_file = st.sidebar.file_uploader("📂 上傳自選股清單 (支援 CSV, XLSX)", type=["csv", "xlsx", "xls"])
 ticker_list = []
 
 if uploaded_file is not None:
-    content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-    found_tickers = list(set(re.findall(r'\b\d{4}\b', content)))
-    st.sidebar.success(f"成功抓取 {len(found_tickers)} 檔股票代碼！")
-    
-    # 檢查並剔除下市股票按鈕
-    if st.sidebar.button("🧹 幫我檢查並剔除下市股票"):
-        with st.spinner("正在連線證交所資料庫比對狀態，請稍候..."):
-            valid_tickers = []
-            for t in found_tickers:
-                try:
-                    # 測試抓取近期資料，抓不到代表已下市或有誤
-                    if not yf.Ticker(f"{t}.TW").history(period="5d").empty:
-                        valid_tickers.append(t)
-                    time.sleep(0.1)
-                except:
-                    pass
+    content = ""
+    try:
+        # 如果是 CSV，嘗試用不同的編碼解讀 (台灣常有 Big5 問題)
+        if uploaded_file.name.endswith('.csv'):
+            try:
+                content = uploaded_file.getvalue().decode("utf-8")
+            except:
+                content = uploaded_file.getvalue().decode("cp950", errors="ignore")
+        # 如果是 Excel，直接交給 pandas 暴力轉成文字
+        else:
+            df_upload = pd.read_excel(uploaded_file)
+            content = df_upload.to_string()
             
-            # 提供下載乾淨清單的功能
-            clean_df = pd.DataFrame({"股票代碼": valid_tickers})
-            csv_data = clean_df.to_csv(index=False).encode('utf-8-sig') # 加上 sig 讓 Excel 打開不會亂碼
-            
-            st.sidebar.success(f"檢查完畢！發現了 {len(found_tickers) - len(valid_tickers)} 檔已下市或無效股票。")
-            st.sidebar.download_button(
-                label="📥 下載更新後的乾淨 CSV",
-                data=csv_data,
-                file_name="Updated_Dolphin_List.csv",
-                mime="text/csv",
-                type="primary"
-            )
-    ticker_list = found_tickers
+        # 暴力抓出所有 4 位數字
+        found_tickers = list(set(re.findall(r'\b\d{4}\b', content)))
+        
+        if len(found_tickers) > 0:
+            st.sidebar.success(f"成功抓取 {len(found_tickers)} 檔股票代碼！")
+        else:
+            st.sidebar.error("檔案讀取成功，但裡面沒有找到 4 位數的股票代碼。")
+
+        # 檢查並剔除下市股票按鈕
+        if st.sidebar.button("🧹 幫我檢查並剔除無效/下市股票"):
+            with st.spinner("正在連線資料庫比對狀態，請稍候..."):
+                valid_tickers = []
+                for t in found_tickers:
+                    try:
+                        if not yf.Ticker(f"{t}.TW").history(period="5d").empty:
+                            valid_tickers.append(t)
+                        time.sleep(0.1)
+                    except:
+                        pass
+                
+                clean_df = pd.DataFrame({"股票代碼": valid_tickers})
+                csv_data = clean_df.to_csv(index=False).encode('utf-8-sig')
+                
+                st.sidebar.success(f"檢查完畢！清除了 {len(found_tickers) - len(valid_tickers)} 筆無效資料 (可能是年份、數量或下市股)。")
+                st.sidebar.download_button(
+                    label="📥 下載乾淨的 CSV 清單",
+                    data=csv_data,
+                    file_name="Clean_Dolphin_List.csv",
+                    mime="text/csv",
+                    type="primary"
+                )
+        ticker_list = found_tickers
+
+    except Exception as e:
+        st.sidebar.error(f"檔案讀取失敗: {e}")
 
 else:
     default_tickers = "2330, 2317, 2454, 2308, 2382, 3231, 2603, 1513, 1519, 2376, 2357, 6235"

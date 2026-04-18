@@ -18,26 +18,54 @@ import requests
 def fetch_stock_names() -> dict:
     """從 TWSE + TPEx OpenAPI 抓取 代碼→名稱 對照表"""
     name_map = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+
     # TWSE 上市
     try:
-        resp = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", timeout=15)
-        for item in resp.json():
-            code = str(item.get("公司代號", "")).strip()
-            name = str(item.get("公司簡稱", "")).strip()
-            if code and name:
-                name_map[code] = name
+        resp = requests.get(
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+            headers=headers, timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            # 自動偵測欄位名稱（TWSE API 格式會變）
+            sample = data[0]
+            code_key = next((k for k in sample if "代號" in k or k == "Code"), None)
+            name_key = next((k for k in sample if "簡稱" in k or k == "Name"), None)
+            if code_key and name_key:
+                for item in data:
+                    c = str(item.get(code_key, "")).strip()
+                    n = str(item.get(name_key, "")).strip()
+                    if c and n:
+                        name_map[c] = n
     except Exception:
         pass
+
     # TPEx 上櫃
     try:
-        resp = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", timeout=15)
-        for item in resp.json():
-            code = str(item.get("SecuritiesCompanyCode", item.get("公司代號", ""))).strip()
-            name = str(item.get("CompanyName", item.get("公司簡稱", ""))).strip()
-            if code and name:
-                name_map[code] = name
+        resp = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+            headers=headers, timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            sample = data[0]
+            code_key = next((k for k in sample if "代號" in k or "Code" in k), None)
+            name_key = next((k for k in sample if "簡稱" in k or "Name" in k), None)
+            if code_key and name_key:
+                for item in data:
+                    c = str(item.get(code_key, "")).strip()
+                    n = str(item.get(name_key, "")).strip()
+                    if c and n:
+                        name_map[c] = n
     except Exception:
         pass
+
     return name_map
 
 # --- 傳產代碼範圍（用於過濾） ---
@@ -364,6 +392,18 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
 
         clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
         stock_name = (name_map or {}).get(clean_symbol, "")
+
+        # 如果 API 沒抓到名稱，從 yfinance 取得（只對通過篩選的股票查詢）
+        if not stock_name:
+            try:
+                info = stock.info
+                stock_name = info.get("shortName", info.get("longName", ""))
+                # yfinance 台股的 shortName 有時是英文，清理一下
+                if stock_name:
+                    stock_name = stock_name.replace(" Corporation", "").replace(" Co., Ltd.", "").strip()
+            except Exception:
+                stock_name = ""
+
         display_code = f"{clean_symbol} {stock_name}" if stock_name else clean_symbol
 
         return {
@@ -501,6 +541,10 @@ if st.button("🚀 開始掃描", type="primary"):
         # 預先載入股票名稱對照表
         with st.spinner("載入股票名稱對照表..."):
             name_map = fetch_stock_names()
+        if name_map:
+            st.caption(f"已載入 {len(name_map)} 檔股票名稱")
+        else:
+            st.caption("股名對照表載入失敗，將從 yfinance 逐筆取得")
 
         results = []
         progress_bar = st.progress(0)
@@ -510,8 +554,9 @@ if st.button("🚀 開始掃描", type="primary"):
         for i, t in enumerate(ticker_list):
             t = t.strip()
             symbol = t if t.endswith((".TW", ".TWO")) else f"{t}.TW"
-            stock_name = name_map.get(t.replace(".TW", "").replace(".TWO", ""), "")
-            status_text.text(f"掃描中: {t} {stock_name} ({i+1}/{total})")
+            clean_code = t.replace(".TW", "").replace(".TWO", "")
+            stock_name = name_map.get(clean_code, "")
+            status_text.text(f"掃描中: {clean_code} {stock_name} ({i+1}/{total})")
 
             result = scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, name_map)
             if result and result["評分"] >= min_score:

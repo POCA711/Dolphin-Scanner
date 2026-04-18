@@ -4,7 +4,8 @@ import pandas as pd
 import numpy as np
 import time
 import re
-import requests
+import json
+import os
 
 # ============================================================
 #  Dolphin V2.1 — OBV 核心波段掃描器 (台股版)
@@ -13,60 +14,22 @@ import requests
 # ============================================================
 
 
-# --- 股票名稱對照表（從 TWSE + TPEx 抓取，快取 24 小時） ---
+# --- 股票名稱對照表（從 repo 內的 stock_names.json 讀取） ---
 @st.cache_data(ttl=86400)
 def fetch_stock_names() -> dict:
-    """從 TWSE + TPEx OpenAPI 抓取 代碼→名稱 對照表"""
-    name_map = {}
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-    }
-
-    # TWSE 上市
-    try:
-        resp = requests.get(
-            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-            headers=headers, timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data:
-            # 自動偵測欄位名稱（TWSE API 格式會變）
-            sample = data[0]
-            code_key = next((k for k in sample if "代號" in k or k == "Code"), None)
-            name_key = next((k for k in sample if "簡稱" in k or k == "Name"), None)
-            if code_key and name_key:
-                for item in data:
-                    c = str(item.get(code_key, "")).strip()
-                    n = str(item.get(name_key, "")).strip()
-                    if c and n:
-                        name_map[c] = n
-    except Exception:
-        pass
-
-    # TPEx 上櫃
-    try:
-        resp = requests.get(
-            "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
-            headers=headers, timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data:
-            sample = data[0]
-            code_key = next((k for k in sample if "代號" in k or "Code" in k), None)
-            name_key = next((k for k in sample if "簡稱" in k or "Name" in k), None)
-            if code_key and name_key:
-                for item in data:
-                    c = str(item.get(code_key, "")).strip()
-                    n = str(item.get(name_key, "")).strip()
-                    if c and n:
-                        name_map[c] = n
-    except Exception:
-        pass
-
-    return name_map
+    """從本地 stock_names.json 讀取股票名稱"""
+    # 嘗試多個可能路徑（Streamlit Cloud 的工作目錄不固定）
+    candidates = [
+        "stock_names.json",
+        os.path.join(os.path.dirname(__file__), "stock_names.json"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return {}
 
 # --- 傳產代碼範圍（用於過濾） ---
 TRADITIONAL_SECTORS = {
@@ -392,18 +355,6 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
 
         clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
         stock_name = (name_map or {}).get(clean_symbol, "")
-
-        # 如果 API 沒抓到名稱，從 yfinance 取得（只對通過篩選的股票查詢）
-        if not stock_name:
-            try:
-                info = stock.info
-                stock_name = info.get("shortName", info.get("longName", ""))
-                # yfinance 台股的 shortName 有時是英文，清理一下
-                if stock_name:
-                    stock_name = stock_name.replace(" Corporation", "").replace(" Co., Ltd.", "").strip()
-            except Exception:
-                stock_name = ""
-
         display_code = f"{clean_symbol} {stock_name}" if stock_name else clean_symbol
 
         return {

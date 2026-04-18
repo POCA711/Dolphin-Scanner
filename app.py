@@ -1,11 +1,10 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-import threading
+from datetime import datetime, timedelta
+import time
 
-# --- 核心邏輯 (與先前相同) ---
 def calculate_obv(df):
     return (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
 
@@ -15,28 +14,19 @@ def is_rejection_candle(df_row):
     if body == 0: return lower_wick > 0 
     return lower_wick > (body * 2)
 
-# --- 介面與執行緒 ---
-def run_scan():
-    btn_scan.config(state=tk.DISABLED)
-    txt_result.delete(1.0, tk.END)
-    txt_result.insert(tk.END, "🚀 掃描啟動中，請稍候...\n\n")
-    
-    tickers_input = entry_tickers.get()
-    use_rejection = var_rejection.get()
-    
-    ticker_list = [t.strip() for t in tickers_input.split(",") if t.strip()]
-    if not ticker_list:
-        messagebox.showwarning("警告", "請輸入至少一檔股票代碼！")
-        btn_scan.config(state=tk.NORMAL)
-        return
-
-    # 使用獨立執行緒避免視窗卡死
-    threading.Thread(target=scan_process, args=(ticker_list, use_rejection), daemon=True).start()
-
-def scan_process(tickers, use_rejection):
+@st.cache_data(ttl=3600)
+def fetch_and_scan(tickers, use_rejection):
     results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(tickers)
+    
     for i, symbol in enumerate(tickers):
-        if not symbol.endswith(".TW"): symbol = f"{symbol}.TW"
+        symbol = symbol.strip()
+        if not symbol.endswith(".TW") and not symbol.endswith(".TWO"):
+            symbol = f"{symbol}.TW"
+            
+        status_text.text(f"正在掃描: {symbol} ({i+1}/{total})")
         
         try:
             stock = yf.Ticker(symbol)
@@ -49,9 +39,11 @@ def scan_process(tickers, use_rejection):
             recent_high = df['High'].tail(60).max()
             recent_low = df['Low'].tail(60).min()
             diff = recent_high - recent_low
-            gp_top, gp_bottom = recent_high - (0.618 * diff), recent_high - (0.65 * diff)
+            gp_top = recent_high - (0.618 * diff)
+            gp_bottom = recent_high - (0.65 * diff)
             
-            current, prev = df.iloc[-1], df.iloc[-2]
+            current = df.iloc[-1]
+            prev = df.iloc[-2]
             
             in_gp = (gp_bottom * 0.985) <= current['Close'] <= (gp_top * 1.015)
             obv_ok = current['OBV'] > current['OBV_MA20']
@@ -59,44 +51,46 @@ def scan_process(tickers, use_rejection):
             rejection_ok = True
             if use_rejection:
                 rejection_ok = is_rejection_candle(current) or is_rejection_candle(prev)
+
             volume_ok = df['Volume'].tail(5).mean() > 1000
 
             if in_gp and obv_ok and rejection_ok and volume_ok:
-                results.append(f"✅ {symbol.replace('.TW','')} | 收盤: {current['Close']:.2f} | 區間: {gp_bottom:.2f}-{gp_top:.2f}")
+                results.append({
+                    "股票代碼": symbol.replace(".TW", ""),
+                    "最新收盤價": round(current['Close'], 2),
+                    "金色口袋 (0.618-0.65)": f"{round(gp_bottom, 2)} - {round(gp_top, 2)}",
+                    "OBV 狀態": "🟢 流入中",
+                    "長影線拒絕": "✅ 觸發" if is_rejection_candle(current) or is_rejection_candle(prev) else "無"
+                })
         except Exception:
             pass
-            
-    # 更新 UI
-    txt_result.delete(1.0, tk.END)
-    if results:
-        txt_result.insert(tk.END, "🎯 發現符合條件的波段標的：\n" + "-"*40 + "\n")
-        for res in results:
-            txt_result.insert(tk.END, res + "\n")
-    else:
-        txt_result.insert(tk.END, "目前市場中沒有符合所有條件的標的。")
         
-    btn_scan.config(state=tk.NORMAL)
+        progress_bar.progress((i + 1) / total)
+        time.sleep(0.1)
+        
+    status_text.text("掃描完成！")
+    return pd.DataFrame(results)
 
-# --- 建立 Windows 介面 ---
-root = tk.Tk()
-root.title("Dolphin 波段資金雷達")
-root.geometry("500x450")
+st.set_page_config(page_title="Dolphin 波段掃描器", layout="wide")
+st.title("🐬 Dolphin 波段資金雷達 (台股版)")
+st.markdown("結合 **OBV 資金流向** 與 **0.618 金色口袋** 的高勝率波段掃描工具。")
 
-tk.Label(root, text="🐬 Dolphin 掃描器 (台股版)", font=("Arial", 16, "bold")).pack(pady=10)
+st.sidebar.header("⚙️ 掃描設定")
+default_tickers = "2330, 2317, 2454, 2308, 2382, 3231, 2603, 1513, 1519, 2376, 2357, 6235, 3481, 2618"
+ticker_input = st.sidebar.text_area("輸入股票代碼 (用逗號分隔)", value=default_tickers)
+use_rejection = st.sidebar.toggle("啟用「長下影線拒絕」過濾", value=True)
+st.sidebar.markdown("---")
+st.sidebar.warning("⚠️ **系統提示**：任何新策略或掃描訊號投入實戰前，請務必先進行歷史回測 (Backtesting) 驗證數據。")
 
-tk.Label(root, text="輸入股票代碼 (用逗號分隔):").pack(anchor="w", padx=20)
-entry_tickers = tk.Entry(root, width=60)
-entry_tickers.insert(0, "2330, 2317, 2454, 2308, 2382, 3231, 2603")
-entry_tickers.pack(padx=20, pady=5)
-
-var_rejection = tk.BooleanVar(value=True)
-chk_rejection = tk.Checkbutton(root, text="啟用「長下影線拒絕」過濾", variable=var_rejection)
-chk_rejection.pack(anchor="w", padx=20, pady=5)
-
-btn_scan = tk.Button(root, text="🚀 開始掃描", bg="lightblue", font=("Arial", 12, "bold"), command=run_scan)
-btn_scan.pack(pady=10)
-
-txt_result = scrolledtext.ScrolledText(root, width=55, height=12, font=("Consolas", 10))
-txt_result.pack(padx=20, pady=10)
-
-root.mainloop()
+if st.button("🚀 開始掃描", type="primary"):
+    ticker_list = [t.strip() for t in ticker_input.split(",") if t.strip()]
+    if not ticker_list:
+        st.error("請輸入至少一檔股票代碼！")
+    else:
+        with st.spinner("系統正在運算指標與比對區間，請稍候..."):
+            df_result = fetch_and_scan(ticker_list, use_rejection)
+            if not df_result.empty:
+                st.success(f"掃描完畢！共發現 {len(df_result)} 檔符合條件的標的。")
+                st.dataframe(df_result, use_container_width=True)
+            else:
+                st.info("目前市場中沒有符合所有條件（進入金色口袋 + 資金流入）的標的。")

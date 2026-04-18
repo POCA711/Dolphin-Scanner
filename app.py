@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
-import re # 加入正則表達式，用來自動抓取 CSV 裡的代碼
+import re
 
 def calculate_obv(df):
     return (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
@@ -66,7 +66,6 @@ def fetch_and_scan(tickers, use_rejection):
             pass
         
         progress_bar.progress((i + 1) / total)
-        # 加入微小延遲，防止被 Yahoo Finance 鎖 IP
         time.sleep(0.15)
         
     status_text.text("掃描完成！")
@@ -76,21 +75,45 @@ st.set_page_config(page_title="Dolphin 波段掃描器", layout="wide")
 st.title("🐬 Dolphin 波段資金雷達 (台股版)")
 st.markdown("結合 **OBV 資金流向** 與 **0.618 金色口袋** 的高勝率波段掃描工具。")
 
-st.sidebar.header("⚙️ 1. 輸入股票代碼")
-st.sidebar.markdown("你可以手動輸入，或是直接上傳 CSV 檔案。")
+st.sidebar.header("⚙️ 1. 輸入或過濾股票代碼")
 
-# --- 新增：CSV 檔案上傳區 ---
+# --- 進階 CSV 功能區 ---
 uploaded_file = st.sidebar.file_uploader("📂 上傳自選股清單 (CSV檔)", type=["csv"])
 ticker_list = []
 
 if uploaded_file is not None:
-    # 自動讀取檔案內容並抓取所有 4 位數代碼
     content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-    found_tickers = re.findall(r'\b\d{4}\b', content)
-    ticker_list = list(set(found_tickers)) # 去除重複
-    st.sidebar.success(f"成功從檔案中抓取 {len(ticker_list)} 檔股票代碼！")
+    found_tickers = list(set(re.findall(r'\b\d{4}\b', content)))
+    st.sidebar.success(f"成功抓取 {len(found_tickers)} 檔股票代碼！")
+    
+    # 檢查並剔除下市股票按鈕
+    if st.sidebar.button("🧹 幫我檢查並剔除下市股票"):
+        with st.spinner("正在連線證交所資料庫比對狀態，請稍候..."):
+            valid_tickers = []
+            for t in found_tickers:
+                try:
+                    # 測試抓取近期資料，抓不到代表已下市或有誤
+                    if not yf.Ticker(f"{t}.TW").history(period="5d").empty:
+                        valid_tickers.append(t)
+                    time.sleep(0.1)
+                except:
+                    pass
+            
+            # 提供下載乾淨清單的功能
+            clean_df = pd.DataFrame({"股票代碼": valid_tickers})
+            csv_data = clean_df.to_csv(index=False).encode('utf-8-sig') # 加上 sig 讓 Excel 打開不會亂碼
+            
+            st.sidebar.success(f"檢查完畢！發現了 {len(found_tickers) - len(valid_tickers)} 檔已下市或無效股票。")
+            st.sidebar.download_button(
+                label="📥 下載更新後的乾淨 CSV",
+                data=csv_data,
+                file_name="Updated_Dolphin_List.csv",
+                mime="text/csv",
+                type="primary"
+            )
+    ticker_list = found_tickers
+
 else:
-    # 如果沒有上傳檔案，就使用輸入框的內容
     default_tickers = "2330, 2317, 2454, 2308, 2382, 3231, 2603, 1513, 1519, 2376, 2357, 6235"
     ticker_input = st.sidebar.text_area("✍️ 手動輸入 (用逗號分隔)", value=default_tickers)
     ticker_list = [t.strip() for t in ticker_input.split(",") if t.strip()]
@@ -103,8 +126,8 @@ if st.button("🚀 開始掃描", type="primary"):
     if not ticker_list:
         st.error("找不到任何股票代碼，請確認檔案內容或手動輸入！")
     else:
-        st.info(f"即將掃描 {len(ticker_list)} 檔股票，數量較多時請耐心等待防封鎖機制...")
-        with st.spinner("系統正在運算指標與比對區間，請稍候..."):
+        st.info(f"即將掃描 {len(ticker_list)} 檔股票，請稍等...")
+        with st.spinner("系統正在運算指標與比對區間..."):
             df_result = fetch_and_scan(ticker_list, use_rejection)
             if not df_result.empty:
                 st.success(f"掃描完畢！共發現 {len(df_result)} 檔符合條件的標的。")

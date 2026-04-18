@@ -300,7 +300,7 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
         # yfinance .TW 的 Volume 單位是「股」，台股 1 張 = 1000 股
         avg_vol_shares = df['Volume'].tail(5).mean()
         avg_vol_lots = avg_vol_shares / 1000
-        if avg_vol_lots < 500:  # 5日均量 < 500 張，流動性不足
+        if avg_vol_lots < 2000:  # 5日均量 < 2000 張，流動性不足
             return None
 
         vol_20d = df['Volume'].tail(20).mean()

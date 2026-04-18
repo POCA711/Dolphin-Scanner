@@ -4,12 +4,41 @@ import pandas as pd
 import numpy as np
 import time
 import re
+import requests
 
 # ============================================================
-#  Dolphin V2 — OBV 核心波段掃描器 (台股版)
+#  Dolphin V2.1 — OBV 核心波段掃描器 (台股版)
 #  核心邏輯：OBV 穿越 + OBV 底背離 + OBV 斜率加速
 #  輔助邏輯：Golden Pocket 結構驗證 + 下影線拒絕
 # ============================================================
+
+
+# --- 股票名稱對照表（從 TWSE + TPEx 抓取，快取 24 小時） ---
+@st.cache_data(ttl=86400)
+def fetch_stock_names() -> dict:
+    """從 TWSE + TPEx OpenAPI 抓取 代碼→名稱 對照表"""
+    name_map = {}
+    # TWSE 上市
+    try:
+        resp = requests.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", timeout=15)
+        for item in resp.json():
+            code = str(item.get("公司代號", "")).strip()
+            name = str(item.get("公司簡稱", "")).strip()
+            if code and name:
+                name_map[code] = name
+    except Exception:
+        pass
+    # TPEx 上櫃
+    try:
+        resp = requests.get("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", timeout=15)
+        for item in resp.json():
+            code = str(item.get("SecuritiesCompanyCode", item.get("公司代號", ""))).strip()
+            name = str(item.get("CompanyName", item.get("公司簡稱", ""))).strip()
+            if code and name:
+                name_map[code] = name
+    except Exception:
+        pass
+    return name_map
 
 # --- 傳產代碼範圍（用於過濾） ---
 TRADITIONAL_SECTORS = {
@@ -262,7 +291,7 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
     return min(score, 100)
 
 
-def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct_pct: float) -> dict | None:
+def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct_pct: float, name_map: dict = None) -> dict | None:
     """掃描單一股票，回傳結果 dict 或 None"""
     try:
         stock = yf.Ticker(symbol)
@@ -334,9 +363,11 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
             obv_signals.append("MA上方")
 
         clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
+        stock_name = (name_map or {}).get(clean_symbol, "")
+        display_code = f"{clean_symbol} {stock_name}" if stock_name else clean_symbol
 
         return {
-            "股票代碼": clean_symbol,
+            "股票": display_code,
             "評分": score,
             "最新收盤": round(current['Close'], 2),
             "OBV 訊號": " | ".join(obv_signals) if obv_signals else "MA上方",
@@ -467,6 +498,10 @@ if st.button("🚀 開始掃描", type="primary"):
     else:
         st.info(f"即將掃描 {len(ticker_list)} 檔股票...")
 
+        # 預先載入股票名稱對照表
+        with st.spinner("載入股票名稱對照表..."):
+            name_map = fetch_stock_names()
+
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -475,9 +510,10 @@ if st.button("🚀 開始掃描", type="primary"):
         for i, t in enumerate(ticker_list):
             t = t.strip()
             symbol = t if t.endswith((".TW", ".TWO")) else f"{t}.TW"
-            status_text.text(f"掃描中: {symbol} ({i+1}/{total})")
+            stock_name = name_map.get(t.replace(".TW", "").replace(".TWO", ""), "")
+            status_text.text(f"掃描中: {t} {stock_name} ({i+1}/{total})")
 
-            result = scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct)
+            result = scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, name_map)
             if result and result["評分"] >= min_score:
                 results.append(result)
 

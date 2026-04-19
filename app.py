@@ -8,7 +8,7 @@ import json
 import os
 
 # ============================================================
-#  Dolphin V2.1 — OBV 核心波段掃描器 (台股版)
+#  Dolphin V2.2 — OBV 核心波段掃描器 (台股版)
 #  核心邏輯：OBV 穿越 + OBV 底背離 + OBV 斜率加速
 #  輔助邏輯：Golden Pocket 結構驗證 + 下影線拒絕
 # ============================================================
@@ -69,16 +69,17 @@ def calculate_obv(df: pd.DataFrame) -> pd.Series:
     return (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
 
 
-def detect_obv_crossover(obv: pd.Series, obv_ma: pd.Series, lookback: int = 3) -> dict:
+def detect_obv_crossover(obv: pd.Series, obv_ma: pd.Series, obv_z: pd.Series = None, lookback: int = 3) -> dict:
     """
     偵測 OBV 穿越 MA 的狀態
     回傳:
       - crossed_up: 最近 lookback 根內 OBV 從下往上穿越 MA
       - bars_since_cross: 穿越後經過幾根 K 線
       - strength: 穿越後 OBV 超出 MA 的幅度 (%)
+      - z_score: OBV 偏離均線的標準差倍數（跨股票可比）
     """
     if len(obv) < lookback + 1 or obv_ma.isna().iloc[-lookback:].any():
-        return {"crossed_up": False, "bars_since_cross": 999, "strength": 0}
+        return {"crossed_up": False, "bars_since_cross": 999, "strength": 0, "z_score": 0}
 
     for i in range(1, lookback + 1):
         idx_now = -i
@@ -87,9 +88,11 @@ def detect_obv_crossover(obv: pd.Series, obv_ma: pd.Series, lookback: int = 3) -
             bars_since = i - 1
             ma_val = obv_ma.iloc[-1]
             strength = ((obv.iloc[-1] - ma_val) / abs(ma_val) * 100) if ma_val != 0 else 0
-            return {"crossed_up": True, "bars_since_cross": bars_since, "strength": round(strength, 2)}
+            z = round(obv_z.iloc[-1], 2) if obv_z is not None and len(obv_z) > 0 else 0
+            return {"crossed_up": True, "bars_since_cross": bars_since, "strength": round(strength, 2), "z_score": z}
 
-    return {"crossed_up": False, "bars_since_cross": 999, "strength": 0}
+    z = round(obv_z.iloc[-1], 2) if obv_z is not None and len(obv_z) > 0 else 0
+    return {"crossed_up": False, "bars_since_cross": 999, "strength": 0, "z_score": z}
 
 
 def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) -> dict:
@@ -235,7 +238,7 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
     """
     綜合評分（0-100）
     核心原則：穿越或背離是「主訊號」，斜率加速是「加分項」
-    單獨斜率加速 + MA上方 不夠格，必須有主訊號才能拿到有意義的分數
+    Z-score 用於跨股票比較 OBV 動能強度
     """
     score = 0
     has_main_signal = cross_info["crossed_up"] or div_info["bullish_div"]
@@ -257,12 +260,22 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
             score += 5
 
     # --- OBV 斜率加速 (0-15 分) ---
-    # 有主訊號時才給滿分，單獨觸發只給 5 分（不足以過門檻）
     if slope_info["accelerating"]:
         if has_main_signal:
-            score += 15  # 加分項：主訊號 + 斜率 = 強確認
+            score += 15
         else:
-            score += 5   # 單獨斜率 = 弱訊號，不足以單獨立案
+            score += 5
+
+    # --- OBV Z-score 動能加分 (0-10 分) ---
+    # Z > 1.5 = OBV 顯著偏離均線，資金流入力道強
+    # 這個分數跨股票可比，不受成交量量級影響
+    z = abs(cross_info.get("z_score", 0))
+    if z >= 2.5:
+        score += 10
+    elif z >= 2.0:
+        score += 7
+    elif z >= 1.5:
+        score += 4
 
     # --- Golden Pocket (0-15 分) ---
     if gp_info.get("in_gp"):
@@ -295,6 +308,10 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
 
         df['OBV'] = calculate_obv(df)
         df['OBV_MA20'] = df['OBV'].rolling(window=20).mean()
+        # Z-score: OBV 偏離均線幾個標準差（跨股票可比）
+        obv_diff = df['OBV'] - df['OBV_MA20']
+        df['OBV_Z'] = obv_diff / obv_diff.rolling(window=28).std()
+        df['OBV_Z'] = df['OBV_Z'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
         current = df.iloc[-1]
         prev = df.iloc[-2]
@@ -312,8 +329,9 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
         # === OBV 核心訊號 ===
         obv = df['OBV']
         obv_ma = df['OBV_MA20']
+        obv_z = df['OBV_Z']
 
-        cross_info = detect_obv_crossover(obv, obv_ma, lookback=3)
+        cross_info = detect_obv_crossover(obv, obv_ma, obv_z, lookback=3)
         div_info = detect_obv_divergence(df, obv, window=20)
         slope_info = detect_obv_slope(obv, short_period=5, long_period=20)
 
@@ -370,11 +388,14 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
         stock_name = (name_map or {}).get(clean_symbol, "")
         display_code = f"{clean_symbol} {stock_name}" if stock_name else clean_symbol
 
+        z_display = cross_info.get("z_score", 0)
+
         return {
             "股票": display_code,
             "評分": score,
             "最新收盤": round(current['Close'], 2),
             "OBV 訊號": " | ".join(obv_signals) if obv_signals else "MA上方",
+            "OBV Z": round(z_display, 1),
             "離背離低點": f"+{runup_pct}%" if div_info["bullish_div"] else "-",
             "5日均量(張)": f"{avg_vol_lots:,.0f}",
             "量比(5/20)": f"{vol_ratio:.2f}x",
@@ -390,9 +411,9 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
 # ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V2.1 OBV 波段掃描器", layout="wide")
-st.title("🐬 Dolphin V2.1 — OBV 核心波段掃描器")
-st.markdown("以 **OBV 資金流向**為核心（穿越 / 底背離 / 斜率加速），單獨斜率不成立，必須有主訊號。")
+st.set_page_config(page_title="Dolphin V2.2 OBV 波段掃描器", layout="wide")
+st.title("🐬 Dolphin V2.2 — OBV 核心波段掃描器")
+st.markdown("以 **OBV 資金流向**為核心（穿越 / 底背離 / 斜率加速 / Z-score 標準化），單獨斜率不成立，必須有主訊號。")
 
 # --- Sidebar ---
 st.sidebar.header("⚙️ 1. 股票池")
@@ -456,16 +477,17 @@ max_runup = st.sidebar.slider("背離後最大漲幅 (%)", 5, 50, 15, 5,
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
-**評分邏輯（V2.1）**
+**評分邏輯（V2.2）**
 - OBV 穿越：15-25分（主訊號）
 - OBV 底背離：20-30分（最強主訊號）
-- OBV 斜率加速：有主訊號+15 / 單獨僅+5
+- OBV 斜率加速：有主訊號+15 / 單獨+5
+- **OBV Z-score：4-10分（跨股票可比）**
 - Golden Pocket：10-15分
 - 下影線拒絕：5分
 - 量能倍數：4-10分
 
-*必須有穿越或背離才算有效訊號*
-*背離後漲幅超過門檻 = 已經跑掉，自動過濾*
+*Z > 1.5 = 動能顯著，Z > 2.5 = 極強*
+*背離後漲幅超過門檻 = 自動過濾*
 """)
 
 # --- 驗證清單按鈕 ---

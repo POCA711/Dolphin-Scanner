@@ -96,9 +96,12 @@ def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) ->
     """
     偵測 OBV 底背離：價格創近期新低，但 OBV 沒有創新低
     這是最強的進場訊號之一 — 主力在低點吸貨
+    回傳 div_low_price: 背離成立時的價格低點，用來計算已漲幅度
     """
+    base = {"bullish_div": False, "div_strength": 0, "div_low_price": 0}
+
     if len(df) < window + 5:
-        return {"bullish_div": False, "div_strength": 0}
+        return base
 
     price_slice = df['Close'].iloc[-window:]
     obv_slice = obv.iloc[-window:]
@@ -109,12 +112,12 @@ def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) ->
 
     # 價格最低點必須在後半段（近期才創低）
     if price_min_pos < window // 3:
-        return {"bullish_div": False, "div_strength": 0}
+        return base
 
     # 前半段的最低價
     first_half = price_slice.iloc[:price_min_pos]
     if len(first_half) < 3:
-        return {"bullish_div": False, "div_strength": 0}
+        return base
 
     prev_low_idx = first_half.idxmin()
     prev_low_price = first_half[prev_low_idx]
@@ -122,7 +125,7 @@ def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) ->
 
     # 價格必須創更低（或接近等低）
     if curr_low_price > prev_low_price * 1.01:
-        return {"bullish_div": False, "div_strength": 0}
+        return base
 
     # OBV 在對應位置：後面的低點 OBV > 前面的低點 OBV = 背離
     obv_at_prev = obv[prev_low_idx]
@@ -133,10 +136,10 @@ def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) ->
         div_strength = round(abs(div_strength), 2)
         # 背離強度 < 2% = OBV 幾乎沒差，不算真正背離
         if div_strength < 2.0:
-            return {"bullish_div": False, "div_strength": div_strength}
-        return {"bullish_div": True, "div_strength": div_strength}
+            return {"bullish_div": False, "div_strength": div_strength, "div_low_price": float(curr_low_price)}
+        return {"bullish_div": True, "div_strength": div_strength, "div_low_price": float(curr_low_price)}
 
-    return {"bullish_div": False, "div_strength": 0}
+    return base
 
 
 def detect_obv_slope(obv: pd.Series, short_period: int = 5, long_period: int = 20) -> dict:
@@ -282,7 +285,7 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
     return min(score, 100)
 
 
-def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct_pct: float, name_map: dict = None) -> dict | None:
+def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct_pct: float, max_runup: float = 15.0, name_map: dict = None) -> dict | None:
     """掃描單一股票，回傳結果 dict 或 None"""
     try:
         stock = yf.Ticker(symbol)
@@ -313,6 +316,16 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
         cross_info = detect_obv_crossover(obv, obv_ma, lookback=3)
         div_info = detect_obv_divergence(df, obv, window=20)
         slope_info = detect_obv_slope(obv, short_period=5, long_period=20)
+
+        # === 背離後漲幅計算 ===
+        # 如果有底背離，算現價離背離低點漲了多少
+        # 超過門檻 = 已經跑掉了，不值得追
+        runup_pct = 0.0
+        if div_info["bullish_div"] and div_info["div_low_price"] > 0:
+            runup_pct = (current['Close'] - div_info["div_low_price"]) / div_info["div_low_price"] * 100
+            runup_pct = round(runup_pct, 1)
+            if runup_pct > max_runup:
+                return None  # 已經漲太多，過濾掉
 
         # OBV 基本條件：必須有「主訊號」（穿越或背離）
         # 單獨「斜率加速 + MA上方」不夠格進入候選
@@ -362,6 +375,7 @@ def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct
             "評分": score,
             "最新收盤": round(current['Close'], 2),
             "OBV 訊號": " | ".join(obv_signals) if obv_signals else "MA上方",
+            "離背離低點": f"+{runup_pct}%" if div_info["bullish_div"] else "-",
             "5日均量(張)": f"{avg_vol_lots:,.0f}",
             "量比(5/20)": f"{vol_ratio:.2f}x",
             "金色口袋": gp_info.get("gp_range", "-") if gp_info.get("in_gp") else "-",
@@ -437,6 +451,9 @@ min_struct_pct = st.sidebar.slider("GP 最小結構幅度 (%)", 5.0, 15.0, 8.0, 
 min_score = st.sidebar.slider("最低評分門檻", 15, 60, 30, 5,
                                help="低於此分數的標的不會顯示（建議 30 以上）")
 
+max_runup = st.sidebar.slider("背離後最大漲幅 (%)", 5, 50, 15, 5,
+                               help="背離低點到現價的漲幅超過此值 = 已經跑掉了，過濾掉")
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 **評分邏輯（V2.1）**
@@ -448,6 +465,7 @@ st.sidebar.markdown("""
 - 量能倍數：4-10分
 
 *必須有穿越或背離才算有效訊號*
+*背離後漲幅超過門檻 = 已經跑掉，自動過濾*
 """)
 
 # --- 驗證清單按鈕 ---
@@ -509,7 +527,7 @@ if st.button("🚀 開始掃描", type="primary"):
             stock_name = name_map.get(clean_code, "")
             status_text.text(f"掃描中: {clean_code} {stock_name} ({i+1}/{total})")
 
-            result = scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, name_map)
+            result = scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, name_map)
             if result and result["評分"] >= min_score:
                 results.append(result)
 

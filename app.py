@@ -233,72 +233,6 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
 #  績效追蹤：歷史訊號回測
 # ============================================================
 
-def backtest_stock(symbol, name_map=None, hold_days=[5, 10, 20]):
-    """
-    對單一股票滾動偵測歷史訊號，隔日開盤進場，追蹤 N 日報酬
-    """
-    try:
-        df = yf.Ticker(symbol).history(period="1y")
-        if len(df) < 120:
-            return []
-        df = prepare_obv_data(df)
-
-        if df['Volume'].tail(20).mean() / 1000 < 2000:
-            return []
-
-        cs = symbol.replace(".TW", "").replace(".TWO", "")
-        nm = (name_map or {}).get(cs, "")
-        display = f"{cs} {nm}" if nm else cs
-        max_hold = max(hold_days)
-
-        signals = []
-        prev_cross = False
-        prev_div = False
-
-        for idx in range(60, len(df) - max_hold - 1):
-            sub = df.iloc[:idx + 1]
-            obv_s, obv_ma_s, obv_z_s = sub['OBV'], sub['OBV_MA20'], sub['OBV_Z']
-
-            cr = detect_obv_crossover(obv_s, obv_ma_s, obv_z_s, lookback=1)
-            dv = detect_obv_divergence(sub, obv_s, window=20)
-
-            new_cross = cr["crossed_up"] and not prev_cross
-            new_div = dv["bullish_div"] and not prev_div
-            prev_cross = cr["crossed_up"]
-            prev_div = dv["bullish_div"]
-
-            if not (new_cross or new_div):
-                continue
-
-            entry_idx = idx + 1
-            if entry_idx >= len(df):
-                continue
-            ep = df['Open'].iloc[entry_idx]
-            if ep <= 0:
-                continue
-
-            st_list = []
-            if new_cross: st_list.append("穿越")
-            if new_div: st_list.append("背離")
-
-            rec = {
-                "股票": display,
-                "訊號日": df.index[idx].strftime("%Y-%m-%d"),
-                "類型": "+".join(st_list),
-                "進場價": round(ep, 2),
-            }
-            for d in hold_days:
-                ei = entry_idx + d
-                if ei < len(df):
-                    rec[f"+{d}日%"] = round((df['Close'].iloc[ei] - ep) / ep * 100, 2)
-                else:
-                    rec[f"+{d}日%"] = None
-            signals.append(rec)
-
-        return signals
-    except Exception:
-        return []
-
 
 # ============================================================
 #  Streamlit UI
@@ -374,7 +308,10 @@ with tab_scan:
             stat.text("完成！")
 
             if results:
-                dfr = pd.DataFrame(results).sort_values("評分", ascending=False).reset_index(drop=True)
+                today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
+                dfr = pd.DataFrame(results)
+                dfr.insert(0, "掃描日", today_str)
+                dfr = dfr.sort_values("評分", ascending=False).reset_index(drop=True)
                 dfr.index += 1
                 st.success(f"{len(dfr)} 檔符合條件")
                 for label, lo, hi, emoji in [("A ≥50", 50, 999, "🔴"), ("B 30-49", 30, 50, "🟡"), ("C <30", 0, 30, "⚪")]:
@@ -382,7 +319,8 @@ with tab_scan:
                     if not sub.empty:
                         st.subheader(f"{emoji} {label} — {len(sub)} 檔")
                         st.dataframe(sub, use_container_width=True)
-                st.download_button("📥 下載", dfr.to_csv(index=False).encode('utf-8-sig'), "Dolphin_V3_Results.csv", "text/csv")
+                fname = f"Dolphin_V3_{today_str}.csv"
+                st.download_button("📥 下載（記得存檔，績效追蹤要用）", dfr.to_csv(index=False).encode('utf-8-sig'), fname, "text/csv")
             else:
                 st.info("沒有符合條件的標的")
 
@@ -392,88 +330,184 @@ with tab_scan:
 # ====================
 with tab_perf:
     st.markdown("""
-    ### 歷史訊號回測
-    用 1 年的資料，滾動偵測所有 OBV 穿越和底背離訊號，
-    以**隔日開盤進場**，追蹤 +5 / +10 / +20 日報酬。
-    不用每天手動記錄 — 跑一次就知道訊號品質。
+    ### 訊號績效追蹤
+    上傳之前的掃描結果 CSV → 自動抓**隔日開盤價**當進場價 → 算到今天的報酬。
+    可以同時上傳多份不同日期的 CSV，一次看所有歷史訊號的表現。
     """)
 
-    bt_mode = st.radio("回測來源", ["✍️ 手動輸入", "📂 上傳掃描結果"], horizontal=True)
+    perf_files = st.file_uploader(
+        "上傳 Dolphin 掃描結果 CSV（可多選）",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
 
-    bt_tickers = []
-    if bt_mode.startswith("✍️"):
-        bt_inp = st.text_area("回測股票（逗號分隔，建議5-20檔）", "2330, 2317, 2454, 3231, 1513, 2308")
-        bt_tickers = [t.strip() for t in bt_inp.split(",") if t.strip()]
-    else:
-        bt_uf = st.file_uploader("上傳 Dolphin 結果 CSV", type=["csv"])
-        if bt_uf:
+    if perf_files and st.button("📊 查看績效", type="primary"):
+        # 1. 讀取所有上傳的 CSV，提取 掃描日 + 股票代碼
+        all_records = []
+        for f in perf_files:
             try:
-                btdf = pd.read_csv(bt_uf, encoding='utf-8-sig')
-                if "股票" in btdf.columns:
-                    bt_tickers = [str(x).split()[0] for x in btdf["股票"] if str(x).strip()]
-                    st.success(f"載入 {len(bt_tickers)} 檔")
+                df_up = pd.read_csv(f, encoding='utf-8-sig')
+                if "股票" not in df_up.columns:
+                    st.warning(f"{f.name} 缺少「股票」欄位，跳過")
+                    continue
+
+                # 取得掃描日
+                if "掃描日" in df_up.columns:
+                    scan_date = str(df_up["掃描日"].iloc[0]).strip()
+                else:
+                    # 嘗試從檔名取得日期 (Dolphin_V3_2026-04-25.csv)
+                    import re as _re
+                    m = _re.search(r'(\d{4}-\d{2}-\d{2})', f.name)
+                    if m:
+                        scan_date = m.group(1)
+                    else:
+                        st.warning(f"{f.name} 沒有掃描日資訊，跳過")
+                        continue
+
+                for _, row in df_up.iterrows():
+                    code = str(row["股票"]).split()[0].strip()
+                    if not code.isdigit():
+                        continue
+                    all_records.append({
+                        "code": code,
+                        "scan_date": scan_date,
+                        "scan_score": row.get("評分", ""),
+                        "scan_signal": row.get("OBV訊號", row.get("OBV 訊號", "")),
+                        "scan_close": row.get("收盤", row.get("最新收盤", "")),
+                        "display": str(row["股票"]),
+                    })
             except Exception as e:
-                st.error(str(e))
+                st.warning(f"{f.name} 讀取失敗: {e}")
 
-    if st.button("📊 開始回測", type="primary"):
-        if not bt_tickers:
-            st.error("請輸入股票")
+        if not all_records:
+            st.error("沒有有效的掃描紀錄")
         else:
-            all_sigs, prog, stat = [], st.progress(0), st.empty()
-            for i, t in enumerate(bt_tickers):
-                t = t.strip()
-                sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
-                if t.endswith((".TW", ".TWO")): sym = t
-                c = t.replace(".TW", "").replace(".TWO", "")
-                stat.text(f"回測: {c} {display_names.get(c, '')} ({i+1}/{len(bt_tickers)})")
-                all_sigs.extend(backtest_stock(sym, display_names))
-                prog.progress((i + 1) / len(bt_tickers))
-                time.sleep(0.15)
-            stat.text("完成！")
+            st.info(f"共 {len(all_records)} 筆訊號，來自 {len(perf_files)} 份掃描...")
 
-            if all_sigs:
-                dfs = pd.DataFrame(all_sigs)
+            results = []
+            prog = st.progress(0)
+            stat = st.empty()
 
-                # 整體統計
+            for i, rec in enumerate(all_records):
+                code = rec["code"]
+                scan_date = rec["scan_date"]
+                stat.text(f"追蹤: {rec['display']} (掃描日 {scan_date}) ({i+1}/{len(all_records)})")
+
+                try:
+                    suffix = universe.get(code, {}).get("suffix", ".TW")
+                    symbol = code + suffix
+
+                    # 從掃描日前 1 天開始抓，確保拿到隔日開盤
+                    start = (pd.Timestamp(scan_date) - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+                    df_price = yf.Ticker(symbol).history(start=start)
+                    if df_price.empty:
+                        continue
+
+                    # 找掃描日之後的第一個交易日 = 進場日
+                    scan_ts = pd.Timestamp(scan_date)
+                    future = df_price[df_price.index > scan_ts]
+                    if len(future) < 1:
+                        continue
+
+                    entry_date = future.index[0]
+                    entry_price = future['Open'].iloc[0]
+                    if entry_price <= 0:
+                        continue
+
+                    # 最新收盤
+                    latest_close = df_price['Close'].iloc[-1]
+                    latest_date = df_price.index[-1]
+                    hold_days = (latest_date - entry_date).days
+                    ret_pct = (latest_close - entry_price) / entry_price * 100
+
+                    # 期間最高/最低（計算 MDD）
+                    hold_period = df_price.loc[entry_date:]
+                    max_price = hold_period['High'].max()
+                    min_price = hold_period['Low'].min()
+                    mfe = (max_price - entry_price) / entry_price * 100
+                    mae = (min_price - entry_price) / entry_price * 100
+
+                    results.append({
+                        "股票": rec["display"],
+                        "掃描日": scan_date,
+                        "評分": rec["scan_score"],
+                        "訊號": rec["scan_signal"],
+                        "進場日": entry_date.strftime("%Y-%m-%d"),
+                        "進場價": round(entry_price, 2),
+                        "現價": round(latest_close, 2),
+                        "持有天數": hold_days,
+                        "報酬%": round(ret_pct, 2),
+                        "最大獲利%": round(mfe, 1),
+                        "最大回撤%": round(mae, 1),
+                        "結果": "✅ 獲利" if ret_pct > 0 else "❌ 虧損",
+                    })
+                except Exception:
+                    pass
+
+                prog.progress((i + 1) / len(all_records))
+                time.sleep(0.1)
+
+            stat.text("追蹤完成！")
+
+            if results:
+                dfp = pd.DataFrame(results)
+
+                # === 整體統計 ===
                 st.subheader("📈 整體績效")
-                stats = {}
-                for col in ["+5日%", "+10日%", "+20日%"]:
-                    v = dfs[col].dropna()
-                    if len(v) > 0:
-                        stats[col] = {
-                            "訊號數": int(len(v)),
-                            "勝率": f"{(v > 0).mean() * 100:.1f}%",
-                            "平均報酬": f"{v.mean():.2f}%",
-                            "中位數": f"{v.median():.2f}%",
-                            "最大獲利": f"+{v.max():.1f}%",
-                            "最大虧損": f"{v.min():.1f}%",
-                            "獲利因子": f"{v[v > 0].sum() / abs(v[v < 0].sum()):.2f}" if (v < 0).any() else "∞",
-                        }
-                if stats:
-                    st.dataframe(pd.DataFrame(stats).T, use_container_width=True)
+                rets = dfp["報酬%"]
+                wins = (rets > 0).sum()
+                losses = (rets <= 0).sum()
+                total = len(rets)
 
-                # 按類型
-                st.subheader("📊 按訊號類型")
-                for st_type in sorted(dfs["類型"].unique()):
-                    sub = dfs[dfs["類型"] == st_type]
-                    if len(sub) < 2: continue
-                    st.markdown(f"**{st_type}**（{len(sub)} 筆）")
-                    ts = {}
-                    for col in ["+5日%", "+10日%", "+20日%"]:
-                        v = sub[col].dropna()
-                        if len(v) > 0:
-                            ts[col] = {
-                                "勝率": f"{(v > 0).mean() * 100:.1f}%",
-                                "平均": f"{v.mean():.2f}%",
-                                "中位數": f"{v.median():.2f}%",
-                            }
-                    if ts:
-                        st.dataframe(pd.DataFrame(ts).T, use_container_width=True)
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("訊號數", total)
+                c2.metric("勝率", f"{wins / total * 100:.1f}%")
+                c3.metric("平均報酬", f"{rets.mean():.2f}%")
+                c4.metric("最大獲利", f"+{rets.max():.1f}%")
+                c5.metric("最大虧損", f"{rets.min():.1f}%")
 
-                # 個股明細
-                st.subheader("📋 訊號明細")
-                st.dataframe(dfs.sort_values("訊號日", ascending=False).reset_index(drop=True), use_container_width=True)
+                # 獲利因子
+                gross_win = rets[rets > 0].sum()
+                gross_loss = abs(rets[rets < 0].sum())
+                pf = f"{gross_win / gross_loss:.2f}" if gross_loss > 0 else "∞"
+                st.caption(f"中位數: {rets.median():.2f}% ｜ 獲利因子: {pf} ｜ 勝{wins} 負{losses}")
 
-                st.download_button("📥 下載回測", dfs.to_csv(index=False).encode('utf-8-sig'), "Dolphin_V3_Backtest.csv", "text/csv")
+                # === 按訊號類型 ===
+                if "訊號" in dfp.columns:
+                    st.subheader("📊 按訊號類型")
+
+                    # 判斷包含哪些訊號
+                    dfp["有背離"] = dfp["訊號"].str.contains("背離", na=False)
+                    dfp["有穿越"] = dfp["訊號"].str.contains("穿越", na=False)
+
+                    type_groups = {
+                        "有背離": dfp[dfp["有背離"]],
+                        "有穿越(無背離)": dfp[dfp["有穿越"] & ~dfp["有背離"]],
+                        "其他": dfp[~dfp["有穿越"] & ~dfp["有背離"]],
+                    }
+
+                    for label, sub in type_groups.items():
+                        if len(sub) < 1:
+                            continue
+                        v = sub["報酬%"]
+                        w = (v > 0).sum()
+                        st.markdown(f"**{label}**（{len(sub)} 筆）— 勝率 {w/len(sub)*100:.1f}%，平均 {v.mean():.2f}%，中位數 {v.median():.2f}%")
+
+                    dfp.drop(columns=["有背離", "有穿越"], inplace=True, errors="ignore")
+
+                # === 按掃描日 ===
+                if dfp["掃描日"].nunique() > 1:
+                    st.subheader("📅 按掃描日")
+                    for sd in sorted(dfp["掃描日"].unique()):
+                        sub = dfp[dfp["掃描日"] == sd]
+                        v = sub["報酬%"]
+                        w = (v > 0).sum()
+                        st.markdown(f"**{sd}**（{len(sub)} 筆）— 勝率 {w/len(sub)*100:.1f}%，平均 {v.mean():.2f}%")
+
+                # === 個股明細 ===
+                st.subheader("📋 個股明細")
+                st.dataframe(dfp.sort_values("報酬%", ascending=False).reset_index(drop=True), use_container_width=True)
+
+                st.download_button("📥 下載績效", dfp.to_csv(index=False).encode('utf-8-sig'), "Dolphin_V3_Performance.csv", "text/csv")
             else:
-                st.info("沒有歷史訊號（可能均量不足或無穿越/背離）")
+                st.info("無法取得任何股票的價格資料")

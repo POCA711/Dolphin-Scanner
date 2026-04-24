@@ -8,22 +8,15 @@ import json
 import os
 
 # ============================================================
-#  Dolphin V2.2 — OBV 核心波段掃描器 (台股版)
-#  核心邏輯：OBV 穿越 + OBV 底背離 + OBV 斜率加速
-#  輔助邏輯：Golden Pocket 結構驗證 + 下影線拒絕
+#  Dolphin V3 — OBV 核心波段掃描器 + 績效追蹤 (台股版)
+#  核心邏輯：OBV 穿越 + OBV 底背離 + OBV 斜率加速 + Z-score
+#  新增：內建股票池、歷史訊號績效追蹤
 # ============================================================
 
 
-# --- 股票名稱對照表（從 repo 內的 stock_names.json 讀取） ---
 @st.cache_data(ttl=86400)
-def fetch_stock_names() -> dict:
-    """從本地 stock_names.json 讀取股票名稱"""
-    # 嘗試多個可能路徑（Streamlit Cloud 的工作目錄不固定）
-    candidates = [
-        "stock_names.json",
-        os.path.join(os.path.dirname(__file__), "stock_names.json"),
-    ]
-    for path in candidates:
+def load_universe():
+    for path in ["universe.json", os.path.join(os.path.dirname(__file__), "universe.json")]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -31,558 +24,456 @@ def fetch_stock_names() -> dict:
             continue
     return {}
 
-# --- 傳產代碼範圍（用於過濾） ---
-TRADITIONAL_SECTORS = {
-    "水泥": (1101, 1199),
-    "食品": (1201, 1299),
-    "塑膠": (1301, 1399),
-    "紡織": (1401, 1499),
-    "電纜": (1601, 1699),
-    "化學": (1701, 1799),
-    "玻璃陶瓷": (1801, 1899),
-    "造紙": (1901, 1999),
-    "鋼鐵": (2001, 2099),
-    "橡膠": (2101, 2199),
-    "汽車": (2201, 2299),
-    "航運": (2601, 2699),
-    "觀光": (2701, 2799),
-    "金融保險": (2801, 2899),
-    "百貨貿易": (2901, 2999),
-    "其他": (9900, 9999),
-}
+
+@st.cache_data(ttl=86400)
+def load_stock_names():
+    for path in ["stock_names.json", os.path.join(os.path.dirname(__file__), "stock_names.json")]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return {}
 
 
-def is_traditional(code_str: str) -> str | None:
-    """回傳產業名稱，如果是傳產的話；否則回傳 None"""
-    try:
-        code = int(code_str.replace(".TW", "").replace(".TWO", ""))
-    except ValueError:
-        return None
-    for sector, (lo, hi) in TRADITIONAL_SECTORS.items():
-        if lo <= code <= hi:
-            return sector
-    return None
+# ============================================================
+#  OBV 核心函數
+# ============================================================
 
-
-def calculate_obv(df: pd.DataFrame) -> pd.Series:
-    """標準 OBV 計算"""
+def calculate_obv(df):
     return (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
 
 
-def detect_obv_crossover(obv: pd.Series, obv_ma: pd.Series, obv_z: pd.Series = None, lookback: int = 3) -> dict:
-    """
-    偵測 OBV 穿越 MA 的狀態
-    回傳:
-      - crossed_up: 最近 lookback 根內 OBV 從下往上穿越 MA
-      - bars_since_cross: 穿越後經過幾根 K 線
-      - strength: 穿越後 OBV 超出 MA 的幅度 (%)
-      - z_score: OBV 偏離均線的標準差倍數（跨股票可比）
-    """
+def detect_obv_crossover(obv, obv_ma, obv_z=None, lookback=3):
     if len(obv) < lookback + 1 or obv_ma.isna().iloc[-lookback:].any():
         return {"crossed_up": False, "bars_since_cross": 999, "strength": 0, "z_score": 0}
-
     for i in range(1, lookback + 1):
-        idx_now = -i
-        idx_prev = -i - 1
-        if obv.iloc[idx_prev] < obv_ma.iloc[idx_prev] and obv.iloc[idx_now] >= obv_ma.iloc[idx_now]:
-            bars_since = i - 1
+        if obv.iloc[-i - 1] < obv_ma.iloc[-i - 1] and obv.iloc[-i] >= obv_ma.iloc[-i]:
             ma_val = obv_ma.iloc[-1]
             strength = ((obv.iloc[-1] - ma_val) / abs(ma_val) * 100) if ma_val != 0 else 0
             z = round(obv_z.iloc[-1], 2) if obv_z is not None and len(obv_z) > 0 else 0
-            return {"crossed_up": True, "bars_since_cross": bars_since, "strength": round(strength, 2), "z_score": z}
-
+            return {"crossed_up": True, "bars_since_cross": i - 1, "strength": round(strength, 2), "z_score": z}
     z = round(obv_z.iloc[-1], 2) if obv_z is not None and len(obv_z) > 0 else 0
     return {"crossed_up": False, "bars_since_cross": 999, "strength": 0, "z_score": z}
 
 
-def detect_obv_divergence(df: pd.DataFrame, obv: pd.Series, window: int = 20) -> dict:
-    """
-    偵測 OBV 底背離：價格創近期新低，但 OBV 沒有創新低
-    這是最強的進場訊號之一 — 主力在低點吸貨
-    回傳 div_low_price: 背離成立時的價格低點，用來計算已漲幅度
-    """
+def detect_obv_divergence(df, obv, window=20):
     base = {"bullish_div": False, "div_strength": 0, "div_low_price": 0}
-
     if len(df) < window + 5:
         return base
-
     price_slice = df['Close'].iloc[-window:]
-    obv_slice = obv.iloc[-window:]
-
-    # 找價格的兩個低點
     price_min_idx = price_slice.idxmin()
     price_min_pos = price_slice.index.get_loc(price_min_idx)
-
-    # 價格最低點必須在後半段（近期才創低）
     if price_min_pos < window // 3:
         return base
-
-    # 前半段的最低價
     first_half = price_slice.iloc[:price_min_pos]
     if len(first_half) < 3:
         return base
-
     prev_low_idx = first_half.idxmin()
-    prev_low_price = first_half[prev_low_idx]
     curr_low_price = price_slice[price_min_idx]
-
-    # 價格必須創更低（或接近等低）
-    if curr_low_price > prev_low_price * 1.01:
+    if curr_low_price > first_half[prev_low_idx] * 1.01:
         return base
-
-    # OBV 在對應位置：後面的低點 OBV > 前面的低點 OBV = 背離
     obv_at_prev = obv[prev_low_idx]
     obv_at_curr = obv[price_min_idx]
-
     if obv_at_curr > obv_at_prev:
-        div_strength = ((obv_at_curr - obv_at_prev) / abs(obv_at_prev) * 100) if obv_at_prev != 0 else 0
-        div_strength = round(abs(div_strength), 2)
-        # 背離強度 < 2% = OBV 幾乎沒差，不算真正背離
-        if div_strength < 2.0:
-            return {"bullish_div": False, "div_strength": div_strength, "div_low_price": float(curr_low_price)}
-        return {"bullish_div": True, "div_strength": div_strength, "div_low_price": float(curr_low_price)}
-
+        ds = ((obv_at_curr - obv_at_prev) / abs(obv_at_prev) * 100) if obv_at_prev != 0 else 0
+        ds = round(abs(ds), 2)
+        if ds < 2.0:
+            return {"bullish_div": False, "div_strength": ds, "div_low_price": float(curr_low_price)}
+        return {"bullish_div": True, "div_strength": ds, "div_low_price": float(curr_low_price)}
     return base
 
 
-def detect_obv_slope(obv: pd.Series, short_period: int = 5, long_period: int = 20) -> dict:
-    """
-    OBV 斜率加速偵測
-    短期 OBV 變化率 vs 長期 OBV 變化率
-    """
+def detect_obv_slope(obv, short_period=5, long_period=20):
     if len(obv) < long_period + 1:
-        return {"accelerating": False, "short_slope": 0, "long_slope": 0}
-
-    obv_clean = obv.replace([np.inf, -np.inf], np.nan).dropna()
-    if len(obv_clean) < long_period + 1:
-        return {"accelerating": False, "short_slope": 0, "long_slope": 0}
-
-    short_slope = (obv_clean.iloc[-1] - obv_clean.iloc[-short_period]) / short_period
-    long_slope = (obv_clean.iloc[-1] - obv_clean.iloc[-long_period]) / long_period
-
-    # 短期斜率 > 長期斜率 且都為正 = 資金加速流入
-    accelerating = (short_slope > 0) and (short_slope > long_slope * 1.5)
-
-    return {
-        "accelerating": accelerating,
-        "short_slope": round(short_slope, 2),
-        "long_slope": round(long_slope, 2),
-    }
+        return {"accelerating": False}
+    oc = obv.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(oc) < long_period + 1:
+        return {"accelerating": False}
+    ss = (oc.iloc[-1] - oc.iloc[-short_period]) / short_period
+    ls = (oc.iloc[-1] - oc.iloc[-long_period]) / long_period
+    return {"accelerating": (ss > 0) and (ss > ls * 1.5)}
 
 
-def validate_golden_pocket(df: pd.DataFrame, min_struct_pct: float = 8.0) -> dict:
-    """
-    Golden Pocket 結構驗證
-    改善：加入結構幅度門檻、確認回撤方向
-    """
-    if len(df) < 60:
-        return {"in_gp": False}
-
-    tail = df.tail(60)
-    recent_high = tail['High'].max()
-    recent_low = tail['Low'].min()
-    high_idx = tail['High'].idxmax()
-    low_idx = tail['Low'].idxmin()
-    current_price = df['Close'].iloc[-1]
-
-    # 結構幅度檢查：波段幅度必須 >= min_struct_pct%
-    struct_pct = (recent_high - recent_low) / recent_low * 100
-    if struct_pct < min_struct_pct:
-        return {"in_gp": False, "reason": "結構幅度不足"}
-
-    # 確認是回撤結構：高點在低點之前 (從高往低拉回)
-    high_pos = tail.index.get_loc(high_idx)
-    low_pos = tail.index.get_loc(low_idx)
-
-    if high_pos >= low_pos:
-        # 高點在低點之後 = 上升趨勢，不是回撤，GP 無意義
-        return {"in_gp": False, "reason": "非回撤結構"}
-
-    diff = recent_high - recent_low
-    gp_top = recent_high - (0.618 * diff)
-    gp_bottom = recent_high - (0.65 * diff)
-
-    in_gp = gp_bottom <= current_price <= gp_top
-
-    # 計算距離 GP 中心的偏離度
-    gp_center = (gp_top + gp_bottom) / 2
-    deviation = abs(current_price - gp_center) / (gp_top - gp_bottom) * 100 if gp_top != gp_bottom else 999
-
-    return {
-        "in_gp": in_gp,
-        "gp_range": f"{round(gp_bottom, 2)} - {round(gp_top, 2)}",
-        "deviation": round(deviation, 2),
-        "struct_pct": round(struct_pct, 2),
-    }
-
-
-def is_rejection_candle(row, direction="bullish") -> bool:
-    """
-    改進版拒絕 K 線偵測
-    bullish: 下影線 > 實體 2 倍（買盤在下方撐住）
-    bearish: 上影線 > 實體 2 倍
-    """
+def is_rejection_candle(row, direction="bullish"):
     body = abs(row['Close'] - row['Open'])
     if body == 0:
-        body = 0.001  # 避免除以零
-
+        body = 0.001
     if direction == "bullish":
-        lower_wick = min(row['Open'], row['Close']) - row['Low']
-        return lower_wick > (body * 2)
-    else:
-        upper_wick = row['High'] - max(row['Open'], row['Close'])
-        return upper_wick > (body * 2)
+        return (min(row['Open'], row['Close']) - row['Low']) > (body * 2)
+    return (row['High'] - max(row['Open'], row['Close'])) > (body * 2)
 
 
-def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_ratio) -> int:
-    """
-    綜合評分（0-100）
-    核心原則：穿越或背離是「主訊號」，斜率加速是「加分項」
-    Z-score 用於跨股票比較 OBV 動能強度
-    """
-    score = 0
-    has_main_signal = cross_info["crossed_up"] or div_info["bullish_div"]
+def validate_golden_pocket(df, min_struct_pct=8.0):
+    if len(df) < 60:
+        return {"in_gp": False}
+    tail = df.tail(60)
+    rh, rl = tail['High'].max(), tail['Low'].min()
+    sp = (rh - rl) / rl * 100
+    if sp < min_struct_pct:
+        return {"in_gp": False}
+    if tail.index.get_loc(tail['High'].idxmax()) >= tail.index.get_loc(tail['Low'].idxmin()):
+        return {"in_gp": False}
+    d = rh - rl
+    gt, gb = rh - 0.618 * d, rh - 0.65 * d
+    ig = gb <= df['Close'].iloc[-1] <= gt
+    gc = (gt + gb) / 2
+    dv = abs(df['Close'].iloc[-1] - gc) / (gt - gb) * 100 if gt != gb else 999
+    return {"in_gp": ig, "gp_range": f"{gb:.2f}-{gt:.2f}", "deviation": round(dv, 2), "struct_pct": round(sp, 2)}
 
-    # --- OBV 穿越 (0-25 分) --- 主訊號
+
+def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_ratio):
+    s = 0
+    hm = cross_info["crossed_up"] or div_info["bullish_div"]
     if cross_info["crossed_up"]:
-        score += 15
-        if cross_info["bars_since_cross"] == 0:
-            score += 10  # 今天剛穿越，最新鮮
-        elif cross_info["bars_since_cross"] == 1:
-            score += 5
-
-    # --- OBV 底背離 (0-30 分) --- 最強主訊號
+        s += 15
+        if cross_info["bars_since_cross"] == 0: s += 10
+        elif cross_info["bars_since_cross"] == 1: s += 5
     if div_info["bullish_div"]:
-        score += 20
-        if div_info["div_strength"] > 10:
-            score += 10
-        elif div_info["div_strength"] > 5:
-            score += 5
-
-    # --- OBV 斜率加速 (0-15 分) ---
-    if slope_info["accelerating"]:
-        if has_main_signal:
-            score += 15
-        else:
-            score += 5
-
-    # --- OBV Z-score 動能加分 (0-10 分) ---
-    # Z > 1.5 = OBV 顯著偏離均線，資金流入力道強
-    # 這個分數跨股票可比，不受成交量量級影響
+        s += 20
+        if div_info["div_strength"] > 10: s += 10
+        elif div_info["div_strength"] > 5: s += 5
+    if slope_info.get("accelerating"):
+        s += 15 if hm else 5
     z = abs(cross_info.get("z_score", 0))
-    if z >= 2.5:
-        score += 10
-    elif z >= 2.0:
-        score += 7
-    elif z >= 1.5:
-        score += 4
-
-    # --- Golden Pocket (0-15 分) ---
+    if z >= 2.5: s += 10
+    elif z >= 2.0: s += 7
+    elif z >= 1.5: s += 4
     if gp_info.get("in_gp"):
-        score += 10
-        if gp_info.get("deviation", 999) < 30:
-            score += 5
-
-    # --- 拒絕 K 線 (0-5 分) ---
-    if has_rejection:
-        score += 5
-
-    # --- 成交量倍數 (0-10 分) ---
-    if vol_ratio >= 3.0:
-        score += 10
-    elif vol_ratio >= 2.0:
-        score += 7
-    elif vol_ratio >= 1.5:
-        score += 4
-
-    return min(score, 100)
+        s += 10
+        if gp_info.get("deviation", 999) < 30: s += 5
+    if has_rejection: s += 5
+    if vol_ratio >= 3.0: s += 10
+    elif vol_ratio >= 2.0: s += 7
+    elif vol_ratio >= 1.5: s += 4
+    return min(s, 100)
 
 
-def scan_single_stock(symbol: str, use_gp: bool, use_rejection: bool, min_struct_pct: float, max_runup: float = 15.0, name_map: dict = None) -> dict | None:
-    """掃描單一股票，回傳結果 dict 或 None"""
+def prepare_obv_data(df):
+    """準備 OBV 相關欄位"""
+    df['OBV'] = calculate_obv(df)
+    df['OBV_MA20'] = df['OBV'].rolling(window=20).mean()
+    od = df['OBV'] - df['OBV_MA20']
+    df['OBV_Z'] = od / od.rolling(window=28).std()
+    df['OBV_Z'] = df['OBV_Z'].replace([np.inf, -np.inf], np.nan).fillna(0)
+    return df
+
+
+# ============================================================
+#  即時掃描
+# ============================================================
+
+def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, name_map=None):
     try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period="6mo")
+        df = yf.Ticker(symbol).history(period="6mo")
         if len(df) < 60:
             return None
+        df = prepare_obv_data(df)
 
-        df['OBV'] = calculate_obv(df)
-        df['OBV_MA20'] = df['OBV'].rolling(window=20).mean()
-        # Z-score: OBV 偏離均線幾個標準差（跨股票可比）
-        obv_diff = df['OBV'] - df['OBV_MA20']
-        df['OBV_Z'] = obv_diff / obv_diff.rolling(window=28).std()
-        df['OBV_Z'] = df['OBV_Z'].replace([np.inf, -np.inf], np.nan).fillna(0)
-
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # === 基本量能門檻 ===
-        # yfinance .TW 的 Volume 單位是「股」，台股 1 張 = 1000 股
-        avg_vol_shares = df['Volume'].tail(5).mean()
-        avg_vol_lots = avg_vol_shares / 1000
-        if avg_vol_lots < 2000:  # 5日均量 < 2000 張，流動性不足
+        cur, prv = df.iloc[-1], df.iloc[-2]
+        avg_vol = df['Volume'].tail(5).mean()
+        lots = avg_vol / 1000
+        if lots < 2000:
             return None
 
         vol_20d = df['Volume'].tail(20).mean()
-        vol_ratio = (avg_vol_shares / vol_20d) if vol_20d > 0 else 0
+        vr = (avg_vol / vol_20d) if vol_20d > 0 else 0
 
-        # === OBV 核心訊號 ===
-        obv = df['OBV']
-        obv_ma = df['OBV_MA20']
-        obv_z = df['OBV_Z']
+        cross = detect_obv_crossover(df['OBV'], df['OBV_MA20'], df['OBV_Z'], lookback=3)
+        div = detect_obv_divergence(df, df['OBV'], window=20)
+        slope = detect_obv_slope(df['OBV'])
 
-        cross_info = detect_obv_crossover(obv, obv_ma, obv_z, lookback=3)
-        div_info = detect_obv_divergence(df, obv, window=20)
-        slope_info = detect_obv_slope(obv, short_period=5, long_period=20)
-
-        # === 背離後漲幅計算 ===
-        # 如果有底背離，算現價離背離低點漲了多少
-        # 超過門檻 = 已經跑掉了，不值得追
-        runup_pct = 0.0
-        if div_info["bullish_div"] and div_info["div_low_price"] > 0:
-            runup_pct = (current['Close'] - div_info["div_low_price"]) / div_info["div_low_price"] * 100
-            runup_pct = round(runup_pct, 1)
-            if runup_pct > max_runup:
-                return None  # 已經漲太多，過濾掉
-
-        # OBV 基本條件：必須有「主訊號」（穿越或背離）
-        # 單獨「斜率加速 + MA上方」不夠格進入候選
-        obv_above_ma = current['OBV'] > current['OBV_MA20']
-        has_main_signal = cross_info["crossed_up"] or div_info["bullish_div"]
-        has_slope = slope_info["accelerating"]
-
-        if not has_main_signal:
-            # 沒有主訊號：只有 斜率+MA上方+放量 才勉強保留
-            if not (has_slope and obv_above_ma and vol_ratio >= 2.0):
+        runup = 0.0
+        if div["bullish_div"] and div["div_low_price"] > 0:
+            runup = round((cur['Close'] - div["div_low_price"]) / div["div_low_price"] * 100, 1)
+            if runup > max_runup:
                 return None
 
-        # === Golden Pocket（可選） ===
-        gp_info = {"in_gp": False, "gp_range": "-", "deviation": 999, "struct_pct": 0}
+        above_ma = cur['OBV'] > cur['OBV_MA20']
+        has_main = cross["crossed_up"] or div["bullish_div"]
+        if not has_main:
+            if not (slope.get("accelerating") and above_ma and vr >= 2.0):
+                return None
+
+        gp = {"in_gp": False}
         if use_gp:
-            gp_info = validate_golden_pocket(df, min_struct_pct)
-
-        # === 拒絕 K 線（可選） ===
-        has_rejection = False
+            gp = validate_golden_pocket(df, min_struct_pct)
+        rej = False
         if use_rejection:
-            has_rejection = is_rejection_candle(current, "bullish") or is_rejection_candle(prev, "bullish")
+            rej = is_rejection_candle(cur) or is_rejection_candle(prv)
 
-        # === 評分 ===
-        score = compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_ratio)
-
-        # 最低分數門檻：至少要有一個明確訊號
-        if score < 15:
+        sc = compute_score(cross, div, slope, gp, rej, vr)
+        if sc < 15:
             return None
 
-        # === 組裝 OBV 訊號標籤 ===
-        obv_signals = []
-        if cross_info["crossed_up"]:
-            obv_signals.append(f"穿越↑ ({cross_info['bars_since_cross']}根前)")
-        if div_info["bullish_div"]:
-            obv_signals.append(f"底背離 ({div_info['div_strength']:.1f}%)")
-        if slope_info["accelerating"]:
-            obv_signals.append("斜率加速")
-        if obv_above_ma and not cross_info["crossed_up"]:
-            obv_signals.append("MA上方")
+        sigs = []
+        if cross["crossed_up"]: sigs.append(f"穿越↑({cross['bars_since_cross']}根前)")
+        if div["bullish_div"]: sigs.append(f"底背離({div['div_strength']:.1f}%)")
+        if slope.get("accelerating"): sigs.append("斜率加速")
+        if above_ma and not cross["crossed_up"]: sigs.append("MA上方")
 
-        clean_symbol = symbol.replace(".TW", "").replace(".TWO", "")
-        stock_name = (name_map or {}).get(clean_symbol, "")
-        display_code = f"{clean_symbol} {stock_name}" if stock_name else clean_symbol
-
-        z_display = cross_info.get("z_score", 0)
+        cs = symbol.replace(".TW", "").replace(".TWO", "")
+        nm = (name_map or {}).get(cs, "")
 
         return {
-            "股票": display_code,
-            "評分": score,
-            "最新收盤": round(current['Close'], 2),
-            "OBV 訊號": " | ".join(obv_signals) if obv_signals else "MA上方",
-            "OBV Z": round(z_display, 1),
-            "離背離低點": f"+{runup_pct}%" if div_info["bullish_div"] else "-",
-            "5日均量(張)": f"{avg_vol_lots:,.0f}",
-            "量比(5/20)": f"{vol_ratio:.2f}x",
-            "金色口袋": gp_info.get("gp_range", "-") if gp_info.get("in_gp") else "-",
-            "結構幅度%": gp_info.get("struct_pct", 0) if gp_info.get("in_gp") else "-",
-            "下影線拒絕": "✅" if has_rejection else "-",
+            "股票": f"{cs} {nm}" if nm else cs,
+            "評分": sc,
+            "收盤": round(cur['Close'], 2),
+            "OBV訊號": " | ".join(sigs),
+            "Z": round(cross.get("z_score", 0), 1),
+            "離背離低點": f"+{runup}%" if div["bullish_div"] else "-",
+            "均量(張)": f"{lots:,.0f}",
+            "量比": f"{vr:.1f}x",
         }
-
     except Exception:
         return None
 
 
 # ============================================================
+#  績效追蹤：歷史訊號回測
+# ============================================================
+
+def backtest_stock(symbol, name_map=None, hold_days=[5, 10, 20]):
+    """
+    對單一股票滾動偵測歷史訊號，隔日開盤進場，追蹤 N 日報酬
+    """
+    try:
+        df = yf.Ticker(symbol).history(period="1y")
+        if len(df) < 120:
+            return []
+        df = prepare_obv_data(df)
+
+        if df['Volume'].tail(20).mean() / 1000 < 2000:
+            return []
+
+        cs = symbol.replace(".TW", "").replace(".TWO", "")
+        nm = (name_map or {}).get(cs, "")
+        display = f"{cs} {nm}" if nm else cs
+        max_hold = max(hold_days)
+
+        signals = []
+        prev_cross = False
+        prev_div = False
+
+        for idx in range(60, len(df) - max_hold - 1):
+            sub = df.iloc[:idx + 1]
+            obv_s, obv_ma_s, obv_z_s = sub['OBV'], sub['OBV_MA20'], sub['OBV_Z']
+
+            cr = detect_obv_crossover(obv_s, obv_ma_s, obv_z_s, lookback=1)
+            dv = detect_obv_divergence(sub, obv_s, window=20)
+
+            new_cross = cr["crossed_up"] and not prev_cross
+            new_div = dv["bullish_div"] and not prev_div
+            prev_cross = cr["crossed_up"]
+            prev_div = dv["bullish_div"]
+
+            if not (new_cross or new_div):
+                continue
+
+            entry_idx = idx + 1
+            if entry_idx >= len(df):
+                continue
+            ep = df['Open'].iloc[entry_idx]
+            if ep <= 0:
+                continue
+
+            st_list = []
+            if new_cross: st_list.append("穿越")
+            if new_div: st_list.append("背離")
+
+            rec = {
+                "股票": display,
+                "訊號日": df.index[idx].strftime("%Y-%m-%d"),
+                "類型": "+".join(st_list),
+                "進場價": round(ep, 2),
+            }
+            for d in hold_days:
+                ei = entry_idx + d
+                if ei < len(df):
+                    rec[f"+{d}日%"] = round((df['Close'].iloc[ei] - ep) / ep * 100, 2)
+                else:
+                    rec[f"+{d}日%"] = None
+            signals.append(rec)
+
+        return signals
+    except Exception:
+        return []
+
+
+# ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V2.2 OBV 波段掃描器", layout="wide")
-st.title("🐬 Dolphin V2.2 — OBV 核心波段掃描器")
-st.markdown("以 **OBV 資金流向**為核心（穿越 / 底背離 / 斜率加速 / Z-score 標準化），單獨斜率不成立，必須有主訊號。")
+st.set_page_config(page_title="Dolphin V3", layout="wide")
+st.title("🐬 Dolphin V3 — OBV 波段掃描 + 績效追蹤")
 
-# --- Sidebar ---
-st.sidebar.header("⚙️ 1. 股票池")
+universe = load_universe()
+name_map = load_stock_names()
+display_names = name_map if name_map else {k: v.get("name", "") for k, v in universe.items()}
 
-uploaded_file = st.sidebar.file_uploader("📂 上傳自選股清單 (CSV / XLSX)", type=["csv", "xlsx", "xls"])
-ticker_list = []
+tab_scan, tab_perf = st.tabs(["🔍 即時掃描", "📊 績效追蹤"])
 
-if uploaded_file is not None:
-    content = ""
-    try:
-        if uploaded_file.name.endswith('.csv'):
+# ====================
+#  Tab 1: 即時掃描
+# ====================
+with tab_scan:
+    st.markdown("以 **OBV 資金流向**為核心（穿越 / 底背離 / 斜率加速 / Z-score）")
+
+    st.sidebar.header("⚙️ 1. 股票池")
+    pool = st.sidebar.radio("來源", ["📦 內建清單", "📂 上傳", "✍️ 手動"], index=0)
+
+    tickers = []
+    if pool.startswith("📦"):
+        if universe:
+            tickers = list(universe.keys())
+            st.sidebar.success(f"內建 {len(tickers)} 檔（已排除傳產）")
+        else:
+            st.sidebar.error("universe.json 未載入")
+    elif pool.startswith("📂"):
+        uf = st.sidebar.file_uploader("CSV/XLSX", type=["csv", "xlsx", "xls"])
+        if uf:
             try:
-                content = uploaded_file.getvalue().decode("utf-8")
-            except Exception:
-                content = uploaded_file.getvalue().decode("cp950", errors="ignore")
-        else:
-            df_upload = pd.read_excel(uploaded_file)
-            content = df_upload.to_string()
-
-        found_tickers = list(set(re.findall(r'\b\d{4}\b', content)))
-
-        if found_tickers:
-            st.sidebar.success(f"讀取到 {len(found_tickers)} 檔股票代碼")
-        else:
-            st.sidebar.error("檔案中沒有找到 4 位數股票代碼")
-
-        ticker_list = found_tickers
-    except Exception as e:
-        st.sidebar.error(f"檔案讀取失敗: {e}")
-else:
-    default_tickers = "2330, 2317, 2454, 2308, 2382, 3231, 2603, 1513, 1519, 2376, 2357, 6235"
-    ticker_input = st.sidebar.text_area("✍️ 手動輸入 (逗號分隔)", value=default_tickers)
-    ticker_list = [t.strip() for t in ticker_input.split(",") if t.strip()]
-
-# --- 傳產過濾 ---
-st.sidebar.header("⚙️ 2. 產業過濾")
-filter_traditional = st.sidebar.toggle("排除傳產股", value=True,
-                                       help="排除水泥/食品/塑膠/紡織/電纜/化學/玻璃/造紙/鋼鐵/橡膠/汽車/航運/觀光/金融/百貨")
-
-if filter_traditional and ticker_list:
-    before_count = len(ticker_list)
-    ticker_list = [t for t in ticker_list if is_traditional(t) is None]
-    removed = before_count - len(ticker_list)
-    if removed > 0:
-        st.sidebar.info(f"已過濾 {removed} 檔傳產股，剩餘 {len(ticker_list)} 檔")
-
-# --- 掃描參數 ---
-st.sidebar.header("⚙️ 3. 訊號過濾")
-use_gp = st.sidebar.toggle("啟用 Golden Pocket 過濾", value=False,
-                            help="只保留價格落在 0.618-0.65 回撤區間的標的")
-use_rejection = st.sidebar.toggle("啟用下影線拒絕過濾", value=False,
-                                  help="要求最近 2 根 K 線出現多方拒絕形態")
-min_struct_pct = st.sidebar.slider("GP 最小結構幅度 (%)", 5.0, 15.0, 8.0, 0.5,
-                                   help="波段高低差佔價格的最小百分比，避免盤整區間的假 Fib") if use_gp else 8.0
-
-min_score = st.sidebar.slider("最低評分門檻", 15, 60, 30, 5,
-                               help="低於此分數的標的不會顯示（建議 30 以上）")
-
-max_runup = st.sidebar.slider("背離後最大漲幅 (%)", 5, 50, 15, 5,
-                               help="背離低點到現價的漲幅超過此值 = 已經跑掉了，過濾掉")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-**評分邏輯（V2.2）**
-- OBV 穿越：15-25分（主訊號）
-- OBV 底背離：20-30分（最強主訊號）
-- OBV 斜率加速：有主訊號+15 / 單獨+5
-- **OBV Z-score：4-10分（跨股票可比）**
-- Golden Pocket：10-15分
-- 下影線拒絕：5分
-- 量能倍數：4-10分
-
-*Z > 1.5 = 動能顯著，Z > 2.5 = 極強*
-*背離後漲幅超過門檻 = 自動過濾*
-""")
-
-# --- 驗證清單按鈕 ---
-st.sidebar.markdown("---")
-if st.sidebar.button("🧹 檢查並剔除無效/下市股票"):
-    if not ticker_list:
-        st.sidebar.error("沒有股票代碼可檢查")
+                if uf.name.endswith('.csv'):
+                    try: ct = uf.getvalue().decode("utf-8")
+                    except: ct = uf.getvalue().decode("cp950", errors="ignore")
+                else:
+                    ct = pd.read_excel(uf).to_string()
+                tickers = list(set(re.findall(r'\b\d{4}\b', ct)))
+                if tickers: st.sidebar.success(f"{len(tickers)} 檔")
+            except Exception as e:
+                st.sidebar.error(str(e))
     else:
-        progress = st.sidebar.progress(0)
-        valid_tickers = []
-        total = len(ticker_list)
-        for i, t in enumerate(ticker_list):
-            sym = f"{t}.TW" if not t.endswith((".TW", ".TWO")) else t
+        inp = st.sidebar.text_area("逗號分隔", "2330, 2317, 2454, 3231, 1513, 1519")
+        tickers = [t.strip() for t in inp.split(",") if t.strip()]
+
+    st.sidebar.header("⚙️ 2. 過濾")
+    use_gp = st.sidebar.toggle("Golden Pocket", value=False)
+    use_rej = st.sidebar.toggle("下影線拒絕", value=False)
+    msp = st.sidebar.slider("GP結構%", 5.0, 15.0, 8.0, 0.5) if use_gp else 8.0
+    min_sc = st.sidebar.slider("最低評分", 15, 60, 30, 5)
+    max_ru = st.sidebar.slider("背離後最大漲幅%", 5, 50, 15, 5)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**V3** 穿越15-25 / 背離20-30 / 斜率+15|+5 / Z 4-10 / GP 10-15 / 拒絕5 / 量比4-10")
+
+    if st.button("🚀 開始掃描", type="primary"):
+        if not tickers:
+            st.error("沒有股票")
+        else:
+            st.info(f"掃描 {len(tickers)} 檔...")
+            results, prog, stat = [], st.progress(0), st.empty()
+            for i, t in enumerate(tickers):
+                t = t.strip()
+                sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
+                if t.endswith((".TW", ".TWO")): sym = t
+                c = t.replace(".TW", "").replace(".TWO", "")
+                stat.text(f"掃描: {c} {display_names.get(c, '')} ({i+1}/{len(tickers)})")
+                r = scan_single_stock(sym, use_gp, use_rej, msp, max_ru, display_names)
+                if r and r["評分"] >= min_sc: results.append(r)
+                prog.progress((i + 1) / len(tickers))
+                time.sleep(0.12)
+            stat.text("完成！")
+
+            if results:
+                dfr = pd.DataFrame(results).sort_values("評分", ascending=False).reset_index(drop=True)
+                dfr.index += 1
+                st.success(f"{len(dfr)} 檔符合條件")
+                for label, lo, hi, emoji in [("A ≥50", 50, 999, "🔴"), ("B 30-49", 30, 50, "🟡"), ("C <30", 0, 30, "⚪")]:
+                    sub = dfr[(dfr["評分"] >= lo) & (dfr["評分"] < hi)] if hi < 999 else dfr[dfr["評分"] >= lo]
+                    if not sub.empty:
+                        st.subheader(f"{emoji} {label} — {len(sub)} 檔")
+                        st.dataframe(sub, use_container_width=True)
+                st.download_button("📥 下載", dfr.to_csv(index=False).encode('utf-8-sig'), "Dolphin_V3_Results.csv", "text/csv")
+            else:
+                st.info("沒有符合條件的標的")
+
+
+# ====================
+#  Tab 2: 績效追蹤
+# ====================
+with tab_perf:
+    st.markdown("""
+    ### 歷史訊號回測
+    用 1 年的資料，滾動偵測所有 OBV 穿越和底背離訊號，
+    以**隔日開盤進場**，追蹤 +5 / +10 / +20 日報酬。
+    不用每天手動記錄 — 跑一次就知道訊號品質。
+    """)
+
+    bt_mode = st.radio("回測來源", ["✍️ 手動輸入", "📂 上傳掃描結果"], horizontal=True)
+
+    bt_tickers = []
+    if bt_mode.startswith("✍️"):
+        bt_inp = st.text_area("回測股票（逗號分隔，建議5-20檔）", "2330, 2317, 2454, 3231, 1513, 2308")
+        bt_tickers = [t.strip() for t in bt_inp.split(",") if t.strip()]
+    else:
+        bt_uf = st.file_uploader("上傳 Dolphin 結果 CSV", type=["csv"])
+        if bt_uf:
             try:
-                if not yf.Ticker(sym).history(period="5d").empty:
-                    valid_tickers.append(t)
-                time.sleep(0.1)
-            except Exception:
-                pass
-            progress.progress((i + 1) / total)
+                btdf = pd.read_csv(bt_uf, encoding='utf-8-sig')
+                if "股票" in btdf.columns:
+                    bt_tickers = [str(x).split()[0] for x in btdf["股票"] if str(x).strip()]
+                    st.success(f"載入 {len(bt_tickers)} 檔")
+            except Exception as e:
+                st.error(str(e))
 
-        removed_count = total - len(valid_tickers)
-        clean_df = pd.DataFrame({"股票代碼": valid_tickers})
-        csv_data = clean_df.to_csv(index=False).encode('utf-8-sig')
-
-        st.sidebar.success(f"清除 {removed_count} 筆無效資料，剩餘 {len(valid_tickers)} 檔")
-        st.sidebar.download_button(
-            label="📥 下載乾淨清單",
-            data=csv_data,
-            file_name="Clean_Dolphin_V2.csv",
-            mime="text/csv",
-            type="primary",
-        )
-
-# --- 主掃描 ---
-if st.button("🚀 開始掃描", type="primary"):
-    if not ticker_list:
-        st.error("找不到任何股票代碼")
-    else:
-        st.info(f"即將掃描 {len(ticker_list)} 檔股票...")
-
-        # 預先載入股票名稱對照表
-        with st.spinner("載入股票名稱對照表..."):
-            name_map = fetch_stock_names()
-        if name_map:
-            st.caption(f"已載入 {len(name_map)} 檔股票名稱")
+    if st.button("📊 開始回測", type="primary"):
+        if not bt_tickers:
+            st.error("請輸入股票")
         else:
-            st.caption("股名對照表載入失敗，將從 yfinance 逐筆取得")
+            all_sigs, prog, stat = [], st.progress(0), st.empty()
+            for i, t in enumerate(bt_tickers):
+                t = t.strip()
+                sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
+                if t.endswith((".TW", ".TWO")): sym = t
+                c = t.replace(".TW", "").replace(".TWO", "")
+                stat.text(f"回測: {c} {display_names.get(c, '')} ({i+1}/{len(bt_tickers)})")
+                all_sigs.extend(backtest_stock(sym, display_names))
+                prog.progress((i + 1) / len(bt_tickers))
+                time.sleep(0.15)
+            stat.text("完成！")
 
-        results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        total = len(ticker_list)
+            if all_sigs:
+                dfs = pd.DataFrame(all_sigs)
 
-        for i, t in enumerate(ticker_list):
-            t = t.strip()
-            symbol = t if t.endswith((".TW", ".TWO")) else f"{t}.TW"
-            clean_code = t.replace(".TW", "").replace(".TWO", "")
-            stock_name = name_map.get(clean_code, "")
-            status_text.text(f"掃描中: {clean_code} {stock_name} ({i+1}/{total})")
+                # 整體統計
+                st.subheader("📈 整體績效")
+                stats = {}
+                for col in ["+5日%", "+10日%", "+20日%"]:
+                    v = dfs[col].dropna()
+                    if len(v) > 0:
+                        stats[col] = {
+                            "訊號數": int(len(v)),
+                            "勝率": f"{(v > 0).mean() * 100:.1f}%",
+                            "平均報酬": f"{v.mean():.2f}%",
+                            "中位數": f"{v.median():.2f}%",
+                            "最大獲利": f"+{v.max():.1f}%",
+                            "最大虧損": f"{v.min():.1f}%",
+                            "獲利因子": f"{v[v > 0].sum() / abs(v[v < 0].sum()):.2f}" if (v < 0).any() else "∞",
+                        }
+                if stats:
+                    st.dataframe(pd.DataFrame(stats).T, use_container_width=True)
 
-            result = scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, name_map)
-            if result and result["評分"] >= min_score:
-                results.append(result)
+                # 按類型
+                st.subheader("📊 按訊號類型")
+                for st_type in sorted(dfs["類型"].unique()):
+                    sub = dfs[dfs["類型"] == st_type]
+                    if len(sub) < 2: continue
+                    st.markdown(f"**{st_type}**（{len(sub)} 筆）")
+                    ts = {}
+                    for col in ["+5日%", "+10日%", "+20日%"]:
+                        v = sub[col].dropna()
+                        if len(v) > 0:
+                            ts[col] = {
+                                "勝率": f"{(v > 0).mean() * 100:.1f}%",
+                                "平均": f"{v.mean():.2f}%",
+                                "中位數": f"{v.median():.2f}%",
+                            }
+                    if ts:
+                        st.dataframe(pd.DataFrame(ts).T, use_container_width=True)
 
-            progress_bar.progress((i + 1) / total)
-            time.sleep(0.12)
+                # 個股明細
+                st.subheader("📋 訊號明細")
+                st.dataframe(dfs.sort_values("訊號日", ascending=False).reset_index(drop=True), use_container_width=True)
 
-        status_text.text("掃描完成！")
-
-        if results:
-            df_result = pd.DataFrame(results).sort_values("評分", ascending=False).reset_index(drop=True)
-            df_result.index += 1  # 排名從 1 開始
-
-            st.success(f"掃描完畢！共 {len(df_result)} 檔符合條件，按評分排序：")
-
-            # 分層顯示
-            tier_a = df_result[df_result["評分"] >= 50]
-            tier_b = df_result[(df_result["評分"] >= 30) & (df_result["評分"] < 50)]
-            tier_c = df_result[df_result["評分"] < 30]
-
-            if not tier_a.empty:
-                st.subheader(f"🔴 A 級（≥50分）— {len(tier_a)} 檔")
-                st.dataframe(tier_a, use_container_width=True)
-
-            if not tier_b.empty:
-                st.subheader(f"🟡 B 級（30-49分）— {len(tier_b)} 檔")
-                st.dataframe(tier_b, use_container_width=True)
-
-            if not tier_c.empty:
-                st.subheader(f"⚪ C 級（<30分）— {len(tier_c)} 檔")
-                st.dataframe(tier_c, use_container_width=True)
-
-            # 下載結果
-            csv_out = df_result.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 下載掃描結果 CSV", csv_out, "Dolphin_V2_Results.csv", "text/csv")
-        else:
-            st.info("目前沒有符合條件的標的。試著降低評分門檻或關閉 GP/拒絕過濾。")
+                st.download_button("📥 下載回測", dfs.to_csv(index=False).encode('utf-8-sig'), "Dolphin_V3_Backtest.csv", "text/csv")
+            else:
+                st.info("沒有歷史訊號（可能均量不足或無穿越/背離）")

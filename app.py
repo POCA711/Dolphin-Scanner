@@ -168,6 +168,10 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
         df = yf.Ticker(symbol).history(period="6mo")
         if len(df) < 60:
             return None
+        # 清理 NaN 收盤價（yfinance 偶爾最後一根不完整）
+        df = df.dropna(subset=['Close'])
+        if len(df) < 60:
+            return None
         df = prepare_obv_data(df)
 
         cur, prv = df.iloc[-1], df.iloc[-2]
@@ -185,7 +189,12 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
 
         runup = 0.0
         if div["bullish_div"] and div["div_low_price"] > 0:
-            runup = round((cur['Close'] - div["div_low_price"]) / div["div_low_price"] * 100, 1)
+            try:
+                runup = round((cur['Close'] - div["div_low_price"]) / div["div_low_price"] * 100, 1)
+                if np.isnan(runup):
+                    runup = 0.0
+            except Exception:
+                runup = 0.0
             if runup > max_runup:
                 return None
 
@@ -212,7 +221,7 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
         if slope.get("accelerating"): sigs.append("斜率加速")
         if above_ma and not cross["crossed_up"]: sigs.append("MA上方")
 
-        cs = symbol.replace(".TW", "").replace(".TWO", "")
+        cs = symbol.replace(".TWO", "").replace(".TW", "")
         nm = (name_map or {}).get(cs, "")
 
         return {
@@ -299,7 +308,7 @@ with tab_scan:
                 t = t.strip()
                 sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
                 if t.endswith((".TW", ".TWO")): sym = t
-                c = t.replace(".TW", "").replace(".TWO", "")
+                c = t.replace(".TWO", "").replace(".TW", "")
                 stat.text(f"掃描: {c} {display_names.get(c, '')} ({i+1}/{len(tickers)})")
                 r = scan_single_stock(sym, use_gp, use_rej, msp, max_ru, display_names)
                 if r and r["評分"] >= min_sc: results.append(r)

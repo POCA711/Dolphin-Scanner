@@ -406,11 +406,14 @@ with tab_perf:
                     suffix = universe.get(code, {}).get("suffix", ".TW")
                     symbol = code + suffix
 
-                    # 從掃描日前 1 天開始抓，確保拿到隔日開盤
+                    # 從掃描日前 3 天開始抓，確保拿到隔日開盤
                     start = (pd.Timestamp(scan_date) - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
                     df_price = yf.Ticker(symbol).history(start=start)
                     if df_price.empty:
                         continue
+
+                    # yfinance 回傳帶時區的 index，統一轉成 tz-naive 避免比較失敗
+                    df_price.index = df_price.index.tz_localize(None)
 
                     # 找掃描日之後的第一個交易日 = 進場日
                     scan_ts = pd.Timestamp(scan_date)

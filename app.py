@@ -125,20 +125,37 @@ def validate_golden_pocket(df, min_struct_pct=8.0):
 def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_ratio):
     s = 0
     hm = cross_info["crossed_up"] or div_info["bullish_div"]
+
+    # --- 穿越 (0-25) ---
+    # 數據顯示：1根前勝率60.9% > 2根前58.3% > 0根前38.9%
+    # 0根前 = 剛穿越隔天追高，最差；1根前 = 確認後進場，最好
     if cross_info["crossed_up"]:
         s += 15
-        if cross_info["bars_since_cross"] == 0: s += 10
-        elif cross_info["bars_since_cross"] == 1: s += 5
+        if cross_info["bars_since_cross"] == 1: s += 10   # 確認穿越，最佳
+        elif cross_info["bars_since_cross"] == 2: s += 5   # 還行
+        # 0根前不加分（追高風險）
+
+    # --- 背離 (0-15) ---
+    # 數據顯示：背離整體 PF 0.89，強度>50%幾乎全虧
+    # 降權重，強度適中(2-50%)才加分，超高強度反而扣分
     if div_info["bullish_div"]:
-        s += 20
-        if div_info["div_strength"] > 10: s += 10
-        elif div_info["div_strength"] > 5: s += 5
+        ds = div_info["div_strength"]
+        if ds <= 50:
+            s += 15  # 正常背離
+        else:
+            s += 5   # 異常高強度，降分
+
+    # --- 斜率 (0-15) ---
     if slope_info.get("accelerating"):
         s += 15 if hm else 5
+
+    # --- Z-score (0-10) ---
     z = abs(cross_info.get("z_score", 0))
     if z >= 2.5: s += 10
     elif z >= 2.0: s += 7
     elif z >= 1.5: s += 4
+
+    # --- GP / 拒絕 / 量比 ---
     if gp_info.get("in_gp"):
         s += 10
         if gp_info.get("deviation", 999) < 30: s += 5
@@ -146,6 +163,7 @@ def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_
     if vol_ratio >= 3.0: s += 10
     elif vol_ratio >= 2.0: s += 7
     elif vol_ratio >= 1.5: s += 4
+
     return min(s, 100)
 
 
@@ -216,8 +234,16 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
             return None
 
         sigs = []
-        if cross["crossed_up"]: sigs.append(f"穿越↑({cross['bars_since_cross']}根前)")
-        if div["bullish_div"]: sigs.append(f"底背離({div['div_strength']:.1f}%)")
+        if cross["crossed_up"]:
+            bars = cross['bars_since_cross']
+            fresh_label = "⚡" if bars == 1 else ""  # 1根前最佳，標記
+            sigs.append(f"穿越↑({bars}根前){fresh_label}")
+        if div["bullish_div"]:
+            ds = div['div_strength']
+            if ds > 50:
+                sigs.append(f"底背離({ds:.1f}%)⚠️")  # 異常高，警告
+            else:
+                sigs.append(f"底背離({ds:.1f}%)")
         if slope.get("accelerating"): sigs.append("斜率加速")
         if above_ma and not cross["crossed_up"]: sigs.append("MA上方")
 
@@ -246,8 +272,8 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
 # ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V3", layout="wide")
-st.title("🐬 Dolphin V3 — OBV 波段掃描 + 績效追蹤")
+st.set_page_config(page_title="Dolphin V3.1", layout="wide")
+st.title("🐬 Dolphin V3.1 — OBV 波段掃描 + 績效追蹤")
 
 universe = load_universe()
 name_map = load_stock_names()
@@ -296,7 +322,7 @@ with tab_scan:
     max_ru = st.sidebar.slider("背離後最大漲幅%", 5, 50, 15, 5)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**V3** 穿越15-25 / 背離20-30 / 斜率+15|+5 / Z 4-10 / GP 10-15 / 拒絕5 / 量比4-10")
+    st.sidebar.markdown("**V3.1** 穿越15+10(1根前最佳)/+5(2根前)/0(0根前追高) / 背離15(≤50%正常)/5(>50%⚠️) / 斜率+15|+5 / Z 4-10")
 
     if st.button("🚀 開始掃描", type="primary"):
         if not tickers:

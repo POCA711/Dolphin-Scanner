@@ -8,9 +8,9 @@ import json
 import os
 
 # ============================================================
-#  Dolphin V3 — OBV 核心波段掃描器 + 績效追蹤 (台股版)
-#  核心邏輯：OBV 穿越 + OBV 底背離 + OBV 斜率加速 + Z-score
-#  新增：內建股票池、歷史訊號績效追蹤
+#  Dolphin V3.2 — OBV 穿越為主訊號 + 績效追蹤 (台股版)
+#  核心：穿越是唯一主訊號，背離/斜率/Z-score 為加分項
+#  依據：156筆實戰數據驗證
 # ============================================================
 
 
@@ -124,38 +124,37 @@ def validate_golden_pocket(df, min_struct_pct=8.0):
 
 def compute_score(cross_info, div_info, slope_info, gp_info, has_rejection, vol_ratio):
     s = 0
-    hm = cross_info["crossed_up"] or div_info["bullish_div"]
 
-    # --- 穿越 (0-25) ---
-    # 數據顯示：1根前勝率60.9% > 2根前58.3% > 0根前38.9%
-    # 0根前 = 剛穿越隔天追高，最差；1根前 = 確認後進場，最好
+    # === 穿越是唯一主訊號 (0-25) ===
+    # 156筆數據: 2根前 WR66.7%/+2.36% > 1根前 57.1%/+2.11% > 0根前 59.0%/+0.99%
+    # 2根前 = 穿越已確認+回踩，最穩；0根前 = 追高，最差
     if cross_info["crossed_up"]:
         s += 15
-        if cross_info["bars_since_cross"] == 1: s += 10   # 確認穿越，最佳
-        elif cross_info["bars_since_cross"] == 2: s += 5   # 還行
-        # 0根前不加分（追高風險）
+        if cross_info["bars_since_cross"] == 2: s += 10   # 最佳：確認+回踩
+        elif cross_info["bars_since_cross"] == 1: s += 7   # 次佳
+        # 0根前不加分
 
-    # --- 背離 (0-15) ---
-    # 數據顯示：背離整體 PF 0.89，強度>50%幾乎全虧
-    # 降權重，強度適中(2-50%)才加分，超高強度反而扣分
+    # === 背離降為加分項 (0-10) ===
+    # 156筆: 背離30筆 WR43.3% 平均-0.23%，穿越126筆 WR61.1% 平均+2.01%
+    # 背離單獨無效，搭配穿越才加分
     if div_info["bullish_div"]:
         ds = div_info["div_strength"]
-        if ds <= 50:
-            s += 15  # 正常背離
+        if cross_info["crossed_up"]:
+            s += 10 if ds <= 50 else 3   # 穿越+背離=確認，加分
         else:
-            s += 5   # 異常高強度，降分
+            s += 3   # 純背離，象徵性給分
 
-    # --- 斜率 (0-15) ---
+    # === 斜率加分 (0-15) ===
     if slope_info.get("accelerating"):
-        s += 15 if hm else 5
+        s += 15 if cross_info["crossed_up"] else 5
 
-    # --- Z-score (0-10) ---
+    # === Z-score (0-10) ===
     z = abs(cross_info.get("z_score", 0))
     if z >= 2.5: s += 10
     elif z >= 2.0: s += 7
     elif z >= 1.5: s += 4
 
-    # --- GP / 拒絕 / 量比 ---
+    # === GP / 拒絕 / 量比 ===
     if gp_info.get("in_gp"):
         s += 10
         if gp_info.get("deviation", 999) < 30: s += 5
@@ -217,8 +216,8 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
                 return None
 
         above_ma = cur['OBV'] > cur['OBV_MA20']
-        has_main = cross["crossed_up"] or div["bullish_div"]
-        if not has_main:
+        # 穿越是唯一主訊號，純背離無法單獨通過
+        if not cross["crossed_up"]:
             if not (slope.get("accelerating") and above_ma and vr >= 2.0):
                 return None
 
@@ -236,14 +235,11 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
         sigs = []
         if cross["crossed_up"]:
             bars = cross['bars_since_cross']
-            fresh_label = "⚡" if bars == 1 else ""  # 1根前最佳，標記
+            fresh_label = "⚡" if bars == 2 else ""  # 2根前=確認+回踩，最佳
             sigs.append(f"穿越↑({bars}根前){fresh_label}")
         if div["bullish_div"]:
             ds = div['div_strength']
-            if ds > 50:
-                sigs.append(f"底背離({ds:.1f}%)⚠️")  # 異常高，警告
-            else:
-                sigs.append(f"底背離({ds:.1f}%)")
+            sigs.append(f"底背離({ds:.1f}%)")  # 降為輔助標籤
         if slope.get("accelerating"): sigs.append("斜率加速")
         if above_ma and not cross["crossed_up"]: sigs.append("MA上方")
 
@@ -272,8 +268,8 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
 # ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V3.1", layout="wide")
-st.title("🐬 Dolphin V3.1 — OBV 波段掃描 + 績效追蹤")
+st.set_page_config(page_title="Dolphin V3.2", layout="wide")
+st.title("🐬 Dolphin V3.2 — OBV 波段掃描 + 績效追蹤")
 
 universe = load_universe()
 name_map = load_stock_names()
@@ -285,7 +281,7 @@ tab_scan, tab_perf = st.tabs(["🔍 即時掃描", "📊 績效追蹤"])
 #  Tab 1: 即時掃描
 # ====================
 with tab_scan:
-    st.markdown("以 **OBV 資金流向**為核心（穿越 / 底背離 / 斜率加速 / Z-score）")
+    st.markdown("以 **OBV 穿越**為唯一主訊號，背離/斜率/Z-score 為加分項。156筆數據驗證。")
 
     st.sidebar.header("⚙️ 1. 股票池")
     pool = st.sidebar.radio("來源", ["📦 內建清單", "📂 上傳", "✍️ 手動"], index=0)
@@ -322,7 +318,7 @@ with tab_scan:
     max_ru = st.sidebar.slider("背離後最大漲幅%", 5, 50, 15, 5)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**V3.1** 穿越15+10(1根前最佳)/+5(2根前)/0(0根前追高) / 背離15(≤50%正常)/5(>50%⚠️) / 斜率+15|+5 / Z 4-10")
+    st.sidebar.markdown("**V3.2** 穿越15+10(2根前⚡)/+7(1根前)/0(0根前) / 背離加分項:有穿越+10,無穿越+3 / 斜率+15|+5 / Z 4-10")
 
     if st.button("🚀 開始掃描", type="primary"):
         if not tickers:

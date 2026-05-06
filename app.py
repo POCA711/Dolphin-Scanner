@@ -8,9 +8,9 @@ import json
 import os
 
 # ============================================================
-#  Dolphin V3.2 — OBV 穿越為主訊號 + 績效追蹤 (台股版)
-#  核心：穿越是唯一主訊號，背離/斜率/Z-score 為加分項
-#  依據：156筆實戰數據驗證
+#  Dolphin V3.3 — OBV 穿越為主訊號 + 櫃買大盤保護 (台股版)
+#  核心：穿越是主訊號，櫃買 > 5MA 為大盤過濾
+#  依據：243筆實戰數據驗證
 # ============================================================
 
 
@@ -268,8 +268,8 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
 # ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V3.2", layout="wide")
-st.title("🐬 Dolphin V3.2 — OBV 波段掃描 + 績效追蹤")
+st.set_page_config(page_title="Dolphin V3.3", layout="wide")
+st.title("🐬 Dolphin V3.3 — OBV 波段掃描 + 績效追蹤")
 
 universe = load_universe()
 name_map = load_stock_names()
@@ -281,7 +281,7 @@ tab_scan, tab_perf = st.tabs(["🔍 即時掃描", "📊 績效追蹤"])
 #  Tab 1: 即時掃描
 # ====================
 with tab_scan:
-    st.markdown("以 **OBV 穿越**為唯一主訊號，背離/斜率/Z-score 為加分項。156筆數據驗證。")
+    st.markdown("以 **OBV 穿越**為主訊號 + **櫃買 > 5MA 大盤保護**。243筆數據驗證。")
 
     st.sidebar.header("⚙️ 1. 股票池")
     pool = st.sidebar.radio("來源", ["📦 內建清單", "📂 上傳", "✍️ 手動"], index=0)
@@ -311,6 +311,8 @@ with tab_scan:
         tickers = [t.strip() for t in inp.split(",") if t.strip()]
 
     st.sidebar.header("⚙️ 2. 過濾")
+    use_market_filter = st.sidebar.toggle("櫃買指數 > 5MA（大盤保護）", value=True,
+                                           help="櫃買指數收在5日均線以下時不出訊號，避免中小股全面被倒貨的日子")
     use_gp = st.sidebar.toggle("Golden Pocket", value=False)
     use_rej = st.sidebar.toggle("下影線拒絕", value=False)
     msp = st.sidebar.slider("GP結構%", 5.0, 15.0, 8.0, 0.5) if use_gp else 8.0
@@ -318,42 +320,80 @@ with tab_scan:
     max_ru = st.sidebar.slider("背離後最大漲幅%", 5, 50, 15, 5)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**V3.2** 穿越15+10(2根前⚡)/+7(1根前)/0(0根前) / 背離加分項:有穿越+10,無穿越+3 / 斜率+15|+5 / Z 4-10")
+    st.sidebar.markdown("**V3.3** 穿越15+10(2根前⚡)/+7(1根前)/0(0根前) / 背離加分+10|+3 / 斜率+15|+5 / Z 4-10 / 櫃買>5MA大盤保護")
 
     if st.button("🚀 開始掃描", type="primary"):
         if not tickers:
             st.error("沒有股票")
         else:
-            st.info(f"掃描 {len(tickers)} 檔...")
-            results, prog, stat = [], st.progress(0), st.empty()
-            for i, t in enumerate(tickers):
-                t = t.strip()
-                sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
-                if t.endswith((".TW", ".TWO")): sym = t
-                c = t.replace(".TWO", "").replace(".TW", "")
-                stat.text(f"掃描: {c} {display_names.get(c, '')} ({i+1}/{len(tickers)})")
-                r = scan_single_stock(sym, use_gp, use_rej, msp, max_ru, display_names)
-                if r and r["評分"] >= min_sc: results.append(r)
-                prog.progress((i + 1) / len(tickers))
-                time.sleep(0.12)
-            stat.text("完成！")
+            # === 大盤過濾：櫃買指數 > 5MA ===
+            market_ok = True
+            tpex_status = ""
+            if use_market_filter:
+                tpex_close = None
+                tpex_ma5 = None
+                tpex_label = ""
 
-            if results:
-                today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
-                dfr = pd.DataFrame(results)
-                dfr.insert(0, "掃描日", today_str)
-                dfr = dfr.sort_values("評分", ascending=False).reset_index(drop=True)
-                dfr.index += 1
-                st.success(f"{len(dfr)} 檔符合條件")
-                for label, lo, hi, emoji in [("A ≥50", 50, 999, "🔴"), ("B 30-49", 30, 50, "🟡"), ("C <30", 0, 30, "⚪")]:
-                    sub = dfr[(dfr["評分"] >= lo) & (dfr["評分"] < hi)] if hi < 999 else dfr[dfr["評分"] >= lo]
-                    if not sub.empty:
-                        st.subheader(f"{emoji} {label} — {len(sub)} 檔")
-                        st.dataframe(sub, use_container_width=True)
-                fname = f"Dolphin_V3_{today_str}.csv"
-                st.download_button("📥 下載（記得存檔，績效追蹤要用）", dfr.to_csv(index=False).encode('utf-8-sig'), fname, "text/csv")
+                # 嘗試多個 ticker：櫃買指數 → 櫃買50 ETF → 加權指數(fallback)
+                for ticker, label in [("^TWOTCI", "櫃買指數"), ("006201.TW", "櫃買50ETF"), ("^TWII", "加權指數")]:
+                    try:
+                        tdf = yf.Ticker(ticker).history(period="1mo")
+                        if len(tdf) >= 5:
+                            tdf.index = tdf.index.tz_localize(None)
+                            tpex_close = tdf['Close'].iloc[-1]
+                            tpex_ma5 = tdf['Close'].tail(5).mean()
+                            tpex_label = label
+                            break
+                    except Exception:
+                        continue
+
+                if tpex_close is not None and tpex_ma5 is not None:
+                    tpex_diff = (tpex_close - tpex_ma5) / tpex_ma5 * 100
+                    if tpex_close > tpex_ma5:
+                        tpex_status = f"🟢 {tpex_label} {tpex_close:.2f} > 5MA {tpex_ma5:.2f} ({tpex_diff:+.2f}%)"
+                        st.success(tpex_status)
+                    else:
+                        tpex_status = f"🔴 {tpex_label} {tpex_close:.2f} < 5MA {tpex_ma5:.2f} ({tpex_diff:+.2f}%)"
+                        st.error(f"{tpex_status} — 中小股環境偏空，今日訊號暫停")
+                        market_ok = False
+                else:
+                    st.warning("大盤指數資料取得失敗，跳過大盤過濾")
+
+            if not market_ok:
+                st.info("大盤保護啟動，今日不出訊號。如果要強制掃描，關閉 sidebar 的「櫃買指數 > 5MA」開關。")
             else:
-                st.info("沒有符合條件的標的")
+                st.info(f"掃描 {len(tickers)} 檔...")
+                results, prog, stat = [], st.progress(0), st.empty()
+                for i, t in enumerate(tickers):
+                    t = t.strip()
+                    sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
+                    if t.endswith((".TW", ".TWO")): sym = t
+                    c = t.replace(".TWO", "").replace(".TW", "")
+                    stat.text(f"掃描: {c} {display_names.get(c, '')} ({i+1}/{len(tickers)})")
+                    r = scan_single_stock(sym, use_gp, use_rej, msp, max_ru, display_names)
+                    if r and r["評分"] >= min_sc: results.append(r)
+                    prog.progress((i + 1) / len(tickers))
+                    time.sleep(0.12)
+                stat.text("完成！")
+
+                if results:
+                    today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
+                    dfr = pd.DataFrame(results)
+                    dfr.insert(0, "掃描日", today_str)
+                    if tpex_status:
+                        dfr.insert(1, "大盤狀態", tpex_status)
+                    dfr = dfr.sort_values("評分", ascending=False).reset_index(drop=True)
+                    dfr.index += 1
+                    st.success(f"{len(dfr)} 檔符合條件")
+                    for label, lo, hi, emoji in [("A ≥50", 50, 999, "🔴"), ("B 30-49", 30, 50, "🟡"), ("C <30", 0, 30, "⚪")]:
+                        sub = dfr[(dfr["評分"] >= lo) & (dfr["評分"] < hi)] if hi < 999 else dfr[dfr["評分"] >= lo]
+                        if not sub.empty:
+                            st.subheader(f"{emoji} {label} — {len(sub)} 檔")
+                            st.dataframe(sub, use_container_width=True)
+                    fname = f"Dolphin_V3_{today_str}.csv"
+                    st.download_button("📥 下載（記得存檔，績效追蹤要用）", dfr.to_csv(index=False).encode('utf-8-sig'), fname, "text/csv")
+                else:
+                    st.info("沒有符合條件的標的")
 
 
 # ====================

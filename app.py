@@ -8,9 +8,9 @@ import json
 import os
 
 # ============================================================
-#  Dolphin V3.3 — OBV 穿越為主訊號 + 櫃買大盤保護 (台股版)
-#  核心：穿越是主訊號，櫃買 > 5MA 為大盤過濾
-#  依據：243筆實戰數據驗證
+#  Dolphin V4 — OBV 穿越 + 價格帶分級 + 大盤保護 (台股版)
+#  級別依據：60-250元+2根前穿越=首選（457筆 WR64% PF3.7）
+#  大盤保護：櫃買/加權 > 5MA
 # ============================================================
 
 
@@ -233,23 +233,40 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
             return None
 
         sigs = []
+        bars_since = cross['bars_since_cross'] if cross["crossed_up"] else 99
         if cross["crossed_up"]:
-            bars = cross['bars_since_cross']
-            fresh_label = "⚡" if bars == 2 else ""  # 2根前=確認+回踩，最佳
-            sigs.append(f"穿越↑({bars}根前){fresh_label}")
+            fresh_label = "⚡" if bars_since == 2 else ""
+            sigs.append(f"穿越↑({bars_since}根前){fresh_label}")
         if div["bullish_div"]:
-            ds = div['div_strength']
-            sigs.append(f"底背離({ds:.1f}%)")  # 降為輔助標籤
+            sigs.append(f"底背離({div['div_strength']:.1f}%)")
         if slope.get("accelerating"): sigs.append("斜率加速")
         if above_ma and not cross["crossed_up"]: sigs.append("MA上方")
 
         cs = symbol.replace(".TWO", "").replace(".TW", "")
         nm = (name_map or {}).get(cs, "")
+        price = round(cur['Close'], 2)
+
+        # === 級別判定（依據 457 筆實戰數據） ===
+        # 60-250元 + 2根前: WR64% PF3.66 → 首選
+        # 60-250元 + 0/1根前, 或 非甜蜜區+2根前 → 可選
+        # <30元 或 無穿越 → 觀望
+        in_sweet = 60 <= price <= 250
+        is_best_cross = bars_since == 2
+
+        if in_sweet and is_best_cross:
+            tier = "🔴 首選"
+        elif in_sweet or is_best_cross:
+            tier = "🟡 可選"
+        elif price < 30:
+            tier = "⚪ 觀望"
+        else:
+            tier = "🟡 可選"
 
         return {
             "股票": f"{cs} {nm}" if nm else cs,
+            "級別": tier,
             "評分": sc,
-            "收盤": round(cur['Close'], 2),
+            "收盤": price,
             "OBV訊號": " | ".join(sigs),
             "Z": round(cross.get("z_score", 0), 1),
             "離背離低點": f"+{runup}%" if div["bullish_div"] else "-",
@@ -268,8 +285,8 @@ def scan_single_stock(symbol, use_gp, use_rejection, min_struct_pct, max_runup, 
 # ============================================================
 #  Streamlit UI
 # ============================================================
-st.set_page_config(page_title="Dolphin V3.3", layout="wide")
-st.title("🐬 Dolphin V3.3 — OBV 波段掃描 + 績效追蹤")
+st.set_page_config(page_title="Dolphin V4", layout="wide")
+st.title("🐬 Dolphin V4 — OBV 波段掃描 + 績效追蹤")
 
 universe = load_universe()
 name_map = load_stock_names()
@@ -281,7 +298,7 @@ tab_scan, tab_perf = st.tabs(["🔍 即時掃描", "📊 績效追蹤"])
 #  Tab 1: 即時掃描
 # ====================
 with tab_scan:
-    st.markdown("以 **OBV 穿越**為主訊號 + **櫃買 > 5MA 大盤保護**。243筆數據驗證。")
+    st.markdown("以 **OBV 穿越**為主訊號 + **價格帶×穿越新鮮度**分級 + **大盤保護**。457筆數據驅動。")
 
     st.sidebar.header("⚙️ 1. 股票池")
     pool = st.sidebar.radio("來源", ["📦 內建清單", "📂 上傳", "✍️ 手動"], index=0)
@@ -320,7 +337,11 @@ with tab_scan:
     max_ru = st.sidebar.slider("背離後最大漲幅%", 5, 50, 15, 5)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**V3.3** 穿越15+10(2根前⚡)/+7(1根前)/0(0根前) / 背離加分+10|+3 / 斜率+15|+5 / Z 4-10 / 櫃買>5MA大盤保護")
+    st.sidebar.markdown("""**V4 級別（457筆驗證）**
+- 🔴 首選：60-250元 + 2根前⚡
+- 🟡 可選：甜蜜區或最佳穿越（擇一）
+- ⚪ 觀望：低價股或弱組合
+    """)
 
     if st.button("🚀 開始掃描", type="primary"):
         if not tickers:
@@ -382,15 +403,32 @@ with tab_scan:
                     dfr.insert(0, "掃描日", today_str)
                     if tpex_status:
                         dfr.insert(1, "大盤狀態", tpex_status)
-                    dfr = dfr.sort_values("評分", ascending=False).reset_index(drop=True)
+
+                    # 按級別排序：首選 > 可選 > 觀望，同級別按評分
+                    tier_order = {"🔴 首選": 0, "🟡 可選": 1, "⚪ 觀望": 2}
+                    dfr["_sort"] = dfr["級別"].map(tier_order).fillna(3)
+                    dfr = dfr.sort_values(["_sort", "評分"], ascending=[True, False]).drop(columns="_sort").reset_index(drop=True)
                     dfr.index += 1
-                    st.success(f"{len(dfr)} 檔符合條件")
-                    for label, lo, hi, emoji in [("A ≥50", 50, 999, "🔴"), ("B 30-49", 30, 50, "🟡"), ("C <30", 0, 30, "⚪")]:
-                        sub = dfr[(dfr["評分"] >= lo) & (dfr["評分"] < hi)] if hi < 999 else dfr[dfr["評分"] >= lo]
+
+                    # 統計
+                    n_top = (dfr["級別"] == "🔴 首選").sum()
+                    n_mid = (dfr["級別"] == "🟡 可選").sum()
+                    n_low = (dfr["級別"] == "⚪ 觀望").sum()
+                    st.success(f"共 {len(dfr)} 檔：🔴首選 {n_top} / 🟡可選 {n_mid} / ⚪觀望 {n_low}")
+
+                    # 分層顯示
+                    for tier_name, tier_desc in [
+                        ("🔴 首選", "60-250元 + 2根前穿越｜WR 64% PF 3.7（457筆驗證）"),
+                        ("🟡 可選", "甜蜜區非最佳穿越，或最佳穿越非甜蜜區"),
+                        ("⚪ 觀望", "低價股或弱訊號組合"),
+                    ]:
+                        sub = dfr[dfr["級別"] == tier_name]
                         if not sub.empty:
-                            st.subheader(f"{emoji} {label} — {len(sub)} 檔")
+                            st.subheader(f"{tier_name} — {len(sub)} 檔")
+                            st.caption(tier_desc)
                             st.dataframe(sub, use_container_width=True)
-                    fname = f"Dolphin_V3_{today_str}.csv"
+
+                    fname = f"Dolphin_V4_{today_str}.csv"
                     st.download_button("📥 下載（記得存檔，績效追蹤要用）", dfr.to_csv(index=False).encode('utf-8-sig'), fname, "text/csv")
                 else:
                     st.info("沒有符合條件的標的")

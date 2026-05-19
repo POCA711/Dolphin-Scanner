@@ -328,8 +328,8 @@ with tab_scan:
         tickers = [t.strip() for t in inp.split(",") if t.strip()]
 
     st.sidebar.header("⚙️ 2. 過濾")
-    use_market_filter = st.sidebar.toggle("櫃買指數 > 5MA（大盤保護）", value=True,
-                                           help="櫃買指數收在5日均線以下時不出訊號，避免中小股全面被倒貨的日子")
+    use_market_filter = st.sidebar.toggle("顯示大盤燈號", value=True,
+                                           help="標記當天大盤狀態（🟢/🔴），不擋掃描，用於績效驗證")
     use_gp = st.sidebar.toggle("Golden Pocket", value=False)
     use_rej = st.sidebar.toggle("下影線拒絕", value=False)
     msp = st.sidebar.slider("GP結構%", 5.0, 15.0, 8.0, 0.5) if use_gp else 8.0
@@ -348,14 +348,12 @@ with tab_scan:
             st.error("沒有股票")
         else:
             # === 大盤過濾：櫃買指數 > 5MA ===
-            market_ok = True
             tpex_status = ""
             if use_market_filter:
                 tpex_close = None
                 tpex_ma5 = None
                 tpex_label = ""
 
-                # 嘗試多個 ticker：櫃買指數 → 櫃買50 ETF → 加權指數(fallback)
                 for ticker, label in [("^TWOTCI", "櫃買指數"), ("006201.TW", "櫃買50ETF"), ("^TWII", "加權指數")]:
                     try:
                         tdf = yf.Ticker(ticker).history(period="1mo")
@@ -375,63 +373,56 @@ with tab_scan:
                         st.success(tpex_status)
                     else:
                         tpex_status = f"🔴 {tpex_label} {tpex_close:.2f} < 5MA {tpex_ma5:.2f} ({tpex_diff:+.2f}%)"
-                        st.error(f"{tpex_status} — 中小股環境偏空，今日訊號暫停")
-                        market_ok = False
+                        st.warning(f"{tpex_status} — 大盤偏空，訊號品質可能下降")
                 else:
-                    st.warning("大盤指數資料取得失敗，跳過大盤過濾")
+                    st.caption("大盤燈號取得失敗，跳過")
 
-            if not market_ok:
-                st.info("大盤保護啟動，今日不出訊號。如果要強制掃描，關閉 sidebar 的「櫃買指數 > 5MA」開關。")
+            st.info(f"掃描 {len(tickers)} 檔...")
+            results, prog, stat = [], st.progress(0), st.empty()
+            for i, t in enumerate(tickers):
+                t = t.strip()
+                sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
+                if t.endswith((".TW", ".TWO")): sym = t
+                c = t.replace(".TWO", "").replace(".TW", "")
+                stat.text(f"掃描: {c} {display_names.get(c, '')} ({i+1}/{len(tickers)})")
+                r = scan_single_stock(sym, use_gp, use_rej, msp, max_ru, display_names)
+                if r and r["評分"] >= min_sc: results.append(r)
+                prog.progress((i + 1) / len(tickers))
+                time.sleep(0.12)
+            stat.text("完成！")
+
+            if results:
+                today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
+                dfr = pd.DataFrame(results)
+                dfr.insert(0, "掃描日", today_str)
+                if tpex_status:
+                    dfr.insert(1, "大盤狀態", tpex_status)
+
+                tier_order = {"🔴 首選": 0, "🟡 可選": 1, "⚪ 觀望": 2}
+                dfr["_sort"] = dfr["級別"].map(tier_order).fillna(3)
+                dfr = dfr.sort_values(["_sort", "評分"], ascending=[True, False]).drop(columns="_sort").reset_index(drop=True)
+                dfr.index += 1
+
+                n_top = (dfr["級別"] == "🔴 首選").sum()
+                n_mid = (dfr["級別"] == "🟡 可選").sum()
+                n_low = (dfr["級別"] == "⚪ 觀望").sum()
+                st.success(f"共 {len(dfr)} 檔：🔴首選 {n_top} / 🟡可選 {n_mid} / ⚪觀望 {n_low}")
+
+                for tier_name, tier_desc in [
+                    ("🔴 首選", "60-250元 + 2根前穿越｜WR 64% PF 3.7（457筆驗證）"),
+                    ("🟡 可選", "甜蜜區非最佳穿越，或最佳穿越非甜蜜區"),
+                    ("⚪ 觀望", "低價股或弱訊號組合"),
+                ]:
+                    sub = dfr[dfr["級別"] == tier_name]
+                    if not sub.empty:
+                        st.subheader(f"{tier_name} — {len(sub)} 檔")
+                        st.caption(tier_desc)
+                        st.dataframe(sub, use_container_width=True)
+
+                fname = f"Dolphin_V4_{today_str}.csv"
+                st.download_button("📥 下載（記得存檔，績效追蹤要用）", dfr.to_csv(index=False).encode('utf-8-sig'), fname, "text/csv")
             else:
-                st.info(f"掃描 {len(tickers)} 檔...")
-                results, prog, stat = [], st.progress(0), st.empty()
-                for i, t in enumerate(tickers):
-                    t = t.strip()
-                    sym = t + (universe.get(t, {}).get("suffix", ".TW") if not t.endswith((".TW", ".TWO")) else "")
-                    if t.endswith((".TW", ".TWO")): sym = t
-                    c = t.replace(".TWO", "").replace(".TW", "")
-                    stat.text(f"掃描: {c} {display_names.get(c, '')} ({i+1}/{len(tickers)})")
-                    r = scan_single_stock(sym, use_gp, use_rej, msp, max_ru, display_names)
-                    if r and r["評分"] >= min_sc: results.append(r)
-                    prog.progress((i + 1) / len(tickers))
-                    time.sleep(0.12)
-                stat.text("完成！")
-
-                if results:
-                    today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
-                    dfr = pd.DataFrame(results)
-                    dfr.insert(0, "掃描日", today_str)
-                    if tpex_status:
-                        dfr.insert(1, "大盤狀態", tpex_status)
-
-                    # 按級別排序：首選 > 可選 > 觀望，同級別按評分
-                    tier_order = {"🔴 首選": 0, "🟡 可選": 1, "⚪ 觀望": 2}
-                    dfr["_sort"] = dfr["級別"].map(tier_order).fillna(3)
-                    dfr = dfr.sort_values(["_sort", "評分"], ascending=[True, False]).drop(columns="_sort").reset_index(drop=True)
-                    dfr.index += 1
-
-                    # 統計
-                    n_top = (dfr["級別"] == "🔴 首選").sum()
-                    n_mid = (dfr["級別"] == "🟡 可選").sum()
-                    n_low = (dfr["級別"] == "⚪ 觀望").sum()
-                    st.success(f"共 {len(dfr)} 檔：🔴首選 {n_top} / 🟡可選 {n_mid} / ⚪觀望 {n_low}")
-
-                    # 分層顯示
-                    for tier_name, tier_desc in [
-                        ("🔴 首選", "60-250元 + 2根前穿越｜WR 64% PF 3.7（457筆驗證）"),
-                        ("🟡 可選", "甜蜜區非最佳穿越，或最佳穿越非甜蜜區"),
-                        ("⚪ 觀望", "低價股或弱訊號組合"),
-                    ]:
-                        sub = dfr[dfr["級別"] == tier_name]
-                        if not sub.empty:
-                            st.subheader(f"{tier_name} — {len(sub)} 檔")
-                            st.caption(tier_desc)
-                            st.dataframe(sub, use_container_width=True)
-
-                    fname = f"Dolphin_V4_{today_str}.csv"
-                    st.download_button("📥 下載（記得存檔，績效追蹤要用）", dfr.to_csv(index=False).encode('utf-8-sig'), fname, "text/csv")
-                else:
-                    st.info("沒有符合條件的標的")
+                st.info("沒有符合條件的標的")
 
 
 # ====================
